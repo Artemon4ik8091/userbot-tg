@@ -2,3 +2,5 @@ modules/
 my_account.session
 my_account.session-journal
 Global_Config.json
+userbot.py
+core_conf.json

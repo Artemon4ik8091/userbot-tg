@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import json
 import asyncio
 import importlib
 from telethon import TelegramClient, events, errors
@@ -9,9 +10,50 @@ import qrcode
 # Подключаем наше общее хранилище из нового файла API
 from registry import modules_repo, pop_restart_info
 
-# --- НАСТРОЙКИ ---
-API_ID = 26907307
-API_HASH = '93d332b9cc58759b6bc4265f2a71f0c9'
+# --- НАСТРОЙКИ КОНФИГА ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(BASE_DIR, "core_conf.json")
+
+def load_or_create_config():
+    """Загружает конфиг core_conf.json, а если его нет - запрашивает данные у пользователя и создает."""
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                config = json.load(f)
+                if "app_id" in config and "hash_id" in config:
+                    return int(config["app_id"]), config["hash_id"]
+        except Exception as e:
+            print(f"[Core] ⚠️ Ошибка при чтении конфига: {e}. Создаем новый.")
+
+    print("\n" + "="*50)
+    print("=== ПЕРВЫЙ ЗАПУСК: НАСТРОЙКА API ТЕЛЕГРАМА ===")
+    print("Получить app_id и hash_id можно на сайте https://my.telegram.org")
+    print("="*50)
+    
+    while True:
+        try:
+            app_id_input = input("Введите ваш app_id (только цифры): ").strip()
+            app_id = int(app_id_input)
+            break
+        except ValueError:
+            print("❌ Ошибка: app_id должен состоять только из цифр. Попробуйте еще раз.")
+            
+    hash_id = input("Введите ваш hash_id (строка): ").strip()
+    
+    config_data = {
+        "app_id": app_id,
+        "hash_id": hash_id
+    }
+    
+    # Сохраняем в конфиг
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(config_data, f, indent=4)
+        
+    print(f"[Core] ✅ Настройки успешно сохранены в файл {CONFIG_FILE}!\n")
+    return app_id, hash_id
+
+# Получаем креды до инициализации клиента
+API_ID, API_HASH = load_or_create_config()
 
 # Прокси (если нужен, оставь. Если дома все работает без него — можно закомментить)
 proxy_config = {

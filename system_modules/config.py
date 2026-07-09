@@ -1,5 +1,7 @@
 from registry import register_cmd, set_module_meta, global_config, set_config
 import json
+import sys
+import importlib
 
 set_module_meta("Settings", "Управление глобальным файлом конфигурации")
 
@@ -70,7 +72,31 @@ async def config_manager(client, event, args):
         # Сохраняем через функцию реестра
         set_config(mod_name, key, parsed_value)
         
-        await event.edit(f"✅ Успешно!\nПараметр `{key}` в модуле `{mod_name}` изменен на `{repr(parsed_value)}`.")
+        # --- БЛОК ГОРЯЧЕЙ ПЕРЕЗАГРУЗКИ МОДУЛЯ ---
+        reload_msg = ""
+        try:
+            # Проверяем, загружен ли вообще этот модуль в память Питона
+            if mod_name in sys.modules:
+                importlib.reload(sys.modules[mod_name])
+                reload_msg = f"\n🔄 Модуль `{mod_name}` перезагружен!"
+            else:
+                # Если его вдруг нет в памяти (например, конфиг есть, а файла модуля уже нет)
+                # Пытаемся импортнуть его с нуля
+                try:
+                    importlib.import_module(mod_name)
+                    reload_msg = f"\n▶️ Модуль `{mod_name}` загружен с нуля!"
+                except ImportError:
+                    reload_msg = f"\n⚠️ Конфиг сохранен, но файл модуля `{mod_name}.py` не найден."
+        except Exception as e:
+            # Если при перезагрузке вылезла ошибка (например синтаксическая)
+            return await event.edit(
+                f"❌ Значение записано, но при перезагрузке модуля `{mod_name}` произошла ошибка:\n`{e}`"
+            )
+
+        # Выводим успех только если релоад прошел гладко
+        await event.edit(
+            f"✅ Успешно!\nПараметр `{key}` в модуле `{mod_name}` изменен на `{repr(parsed_value)}`." + reload_msg
+        )
         
     else:
         await event.edit("❌ Неизвестное действие. Напиши `.cfg help`")

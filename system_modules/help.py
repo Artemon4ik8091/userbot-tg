@@ -17,7 +17,7 @@ async def help_cmd(client, event, args):
         for mod_id, mod_info in modules_repo["modules"].items():
             mod_name = mod_info["name"]
             is_system = mod_info.get("system", False)
-            badge = " 🔒 *Системное*" if is_system else ""
+            badge = " 🔒" if is_system else ""
             cmds = [f".{c}" for c in mod_info["commands"].keys()]
             cmds_str = ", ".join(cmds) if cmds else "Нет команд"
 

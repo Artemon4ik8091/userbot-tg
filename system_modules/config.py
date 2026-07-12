@@ -9,11 +9,18 @@ def parse_value(val):
     """Превращает строку в нужный тип данных (число, булево значение)"""
     if val.lower() in ['true', 'on']: return True
     if val.lower() in ['false', 'off']: return False
-    if val.isdigit(): return int(val)
+    
+    # Сначала пытаемся превратить в целое число (поддерживает минусы)
+    try:
+        return int(val)
+    except ValueError:
+        pass # Если не получилось, идем дальше
+        
+    # Затем пытаемся в число с плавающей точкой
     try:
         return float(val)
     except ValueError:
-        return val # Оставляем как строку
+        return val # Оставляем как строку, если это обычный текст
 
 @register_cmd("cfg", desc="Управление конфигом. Юзай: .cfg help")
 async def config_manager(client, event, args):

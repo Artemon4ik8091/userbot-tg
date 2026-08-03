@@ -9,6 +9,7 @@ import re
 import psutil
 from datetime import datetime
 from telethon import TelegramClient, events, errors, Button
+from telethon.sessions import MemorySession
 import qrcode
 
 # Подключаем наше общее хранилище из реестра
@@ -26,6 +27,12 @@ from registry import (
     inline_payload_cache,
     save_restart_info
 )
+
+proxy_config = {
+    'proxy_type': 'http',
+    'addr': '127.0.0.1',
+    'port': 2080
+}
 
 # --- НАСТРОЙКИ КОНФИГА ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -77,12 +84,6 @@ def save_core_config(config_data):
 raw_config = load_or_create_config()
 API_ID = int(raw_config["app_id"])
 API_HASH = raw_config["hash_id"]
-
-proxy_config = {
-    'proxy_type': 'http',
-    'addr': '127.0.0.1',
-    'port': 2080
-}
 
 # Инициализируем юзербот клиента
 client = TelegramClient(
@@ -163,8 +164,8 @@ async def auto_setup_bot(userbot_client, me):
 
     bot_token = input("Введите Bot Token (например: 123456789:ABC...): ").strip()
     
-    # Извлекаем username бота через временный клиент
-    temp_bot = TelegramClient('temp_bot', API_ID, API_HASH)
+    # Извлекаем username бота через временный клиент в оперативной памяти
+    temp_bot = TelegramClient(MemorySession(), API_ID, API_HASH)
     await temp_bot.start(bot_token=bot_token)
     temp_me = await temp_bot.get_me()
     bot_username = temp_me.username or f"id_{temp_me.id}"
@@ -415,15 +416,32 @@ async def main():
 
     # Инициализация и автонастройка встроенного Telegram Бота
     bot_token, bot_username, is_first_run = await auto_setup_bot(client, me)
-    bot_client = TelegramClient(
-        'bot_session',
-        API_ID,
-        API_HASH,
-        device_model="MacBook Pro",
-        system_version="macOS 14.5",
-        app_version="10.11.1"
-    )
-    await bot_client.start(bot_token=bot_token)
+    try:
+        bot_client = TelegramClient(
+            'bot_session',
+            API_ID,
+            API_HASH,
+            device_model="MacBook Pro",
+            system_version="macOS 14.5",
+            app_version="10.11.1"
+        )
+        await bot_client.start(bot_token=bot_token)
+    except Exception as e:
+        print(f"[Core] ⚠️ Сессия бота повреждена или несовместима ({e}). Пересоздаем bot_session.session...")
+        if os.path.exists("bot_session.session"):
+            try:
+                os.remove("bot_session.session")
+            except Exception:
+                pass
+        bot_client = TelegramClient(
+            'bot_session',
+            API_ID,
+            API_HASH,
+            device_model="MacBook Pro",
+            system_version="macOS 14.5",
+            app_version="10.11.1"
+        )
+        await bot_client.start(bot_token=bot_token)
     set_bot(bot_client, bot_username)
     setup_core_bot_handlers(bot_client)
     print(f"[Core] 🤖 Встроенный Telegram Бот активен (@{bot_username})!")

@@ -170,3 +170,105 @@ def pop_restart_info():
         except OSError:
             pass
     return data
+
+
+# --- ХРАНИЛИЩЕ БОТА, ВЛАДЕЛЬЦА И ИНЛАЙН ИНФРАСТРУКТУРЫ ---
+bot_instance = {
+    "client": None,
+    "username": None,
+    "owner_id": None,
+    "start_time": time.time()
+}
+
+callback_handlers = {}
+inline_payload_cache = {}
+
+def set_bot(client, username=None):
+    """Сохраняет инстанс TelegramClient бота и его юзернейм"""
+    bot_instance["client"] = client
+    if username:
+        bot_instance["username"] = username.replace("@", "")
+
+def get_bot():
+    """Возвращает инстанс TelegramClient для бота"""
+    return bot_instance["client"]
+
+def set_bot_client(client):
+    """Сохраняет инстанс TelegramClient для бота (совместимость)"""
+    bot_instance["client"] = client
+
+def get_bot_client():
+    """Возвращает инстанс TelegramClient для бота"""
+    return bot_instance["client"]
+
+def get_bot_username():
+    """Возвращает юзернейм бота (без @)"""
+    return bot_instance["username"]
+
+def set_owner_id(owner_id):
+    """Сохраняет Telegram ID владельца юзербота"""
+    bot_instance["owner_id"] = owner_id
+
+def get_owner_id():
+    """Возвращает Telegram ID владельца юзербота"""
+    return bot_instance["owner_id"]
+
+def get_userbot_start_time():
+    """Возвращает время запуска юзербота"""
+    return bot_instance["start_time"]
+
+async def send_bot_notification(text):
+    """
+    Отправляет уведомление владельцу юзербота через ТГ бота (если бот активен)
+    с автоматическим резолвом сущности пользователя при необходимости.
+    """
+    client = get_bot()
+    owner_id = get_owner_id()
+    if client and owner_id:
+        try:
+            await client.send_message(owner_id, text)
+            return True
+        except Exception:
+            try:
+                entity = await client.get_entity(owner_id)
+                await client.send_message(entity, text)
+                return True
+            except Exception as ex:
+                print(f"[Registry] ⚠️ Не удалось отправить уведомление через бота: {ex}")
+    return False
+
+def register_callback(prefix):
+    """
+    Декоратор для регистрации функций-обработчиков инлайн-кнопок в модулях.
+    Пример:
+        @register_callback("my_prefix")
+        async def handle_click(event, data):
+            await event.answer("Нажато!")
+    """
+    def decorator(func):
+        callback_handlers[prefix] = func
+        return func
+    return decorator
+
+async def send_inline(client, chat_id, text, buttons=None, reply_to=None):
+    """
+    Отправляет сообщение с инлайн-кнопками в любой чат через встроенного бота.
+    Модули юзербота могут использовать эту функцию для вывода интерактивных элементов.
+    """
+    bot_username = get_bot_username()
+    if not bot_username:
+        raise ValueError("Встроенный Telegram Бот не запущен или отсутствует username")
+
+    payload_id = f"inl_{int(time.time() * 1000)}"
+    inline_payload_cache[payload_id] = {
+        "text": text,
+        "buttons": buttons
+    }
+
+    try:
+        results = await client.inline_query(bot_username, payload_id)
+        if results:
+            return await results[0].click(chat_id, reply_to=reply_to)
+    except Exception as e:
+        print(f"[Registry] Ошибка отправки inline-сообщения: {e}")
+        raise e

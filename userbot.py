@@ -85,7 +85,7 @@ raw_config = load_or_create_config()
 API_ID = int(raw_config["app_id"])
 API_HASH = raw_config["hash_id"]
 
-# Инициализируем юзербот клиента
+# Инициализируем юзербот клиента (тут прокси был настроен изначально)
 client = TelegramClient(
     'my_account',
     API_ID,
@@ -164,8 +164,8 @@ async def auto_setup_bot(userbot_client, me):
 
     bot_token = input("Введите Bot Token (например: 123456789:ABC...): ").strip()
     
-    # Извлекаем username бота через временный клиент в оперативной памяти
-    temp_bot = TelegramClient(MemorySession(), API_ID, API_HASH)
+    # Извлекаем username бота через временный клиент в оперативной памяти (Добавлен прокси!)
+    temp_bot = TelegramClient(MemorySession(), API_ID, API_HASH, proxy=proxy_config)
     await temp_bot.start(bot_token=bot_token)
     temp_me = await temp_bot.get_me()
     bot_username = temp_me.username or f"id_{temp_me.id}"
@@ -417,13 +417,15 @@ async def main():
     # Инициализация и автонастройка встроенного Telegram Бота
     bot_token, bot_username, is_first_run = await auto_setup_bot(client, me)
     try:
+        # ДОБАВЛЕН proxy=proxy_config
         bot_client = TelegramClient(
             'bot_session',
             API_ID,
             API_HASH,
             device_model="MacBook Pro",
             system_version="macOS 14.5",
-            app_version="10.11.1"
+            app_version="10.11.1",
+            proxy=proxy_config 
         )
         await bot_client.start(bot_token=bot_token)
     except Exception as e:
@@ -433,15 +435,19 @@ async def main():
                 os.remove("bot_session.session")
             except Exception:
                 pass
+        
+        # ДОБАВЛЕН proxy=proxy_config и здесь тоже
         bot_client = TelegramClient(
             'bot_session',
             API_ID,
             API_HASH,
             device_model="MacBook Pro",
             system_version="macOS 14.5",
-            app_version="10.11.1"
+            app_version="10.11.1",
+            proxy=proxy_config 
         )
         await bot_client.start(bot_token=bot_token)
+        
     set_bot(bot_client, bot_username)
     setup_core_bot_handlers(bot_client)
     print(f"[Core] 🤖 Встроенный Telegram Бот активен (@{bot_username})!")

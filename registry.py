@@ -3,6 +3,71 @@ import inspect
 import json
 import os
 import time
+import asyncio
+from datetime import datetime, timedelta
+from telethon import errors
+
+# --- СИСТЕМА ОГРАНИЧЕНИЙ И ЗАЩИТЫ ОТ СПАМБАНА (Rate Limiter / FloodWait) ---
+rate_limiter_state = {
+    "until": 0.0,
+    "last_cmd_time": 0.0,
+    "min_interval": 0.3  # Минимальная задержка между командами (в секундах)
+}
+
+def is_rate_limited():
+    """Проверяет, действует ли сейчас ограничение на отправку запросов"""
+    return time.time() < rate_limiter_state["until"]
+
+def get_rate_limit_remaining():
+    """Возвращает оставшееся время ограничения в секундах"""
+    rem = rate_limiter_state["until"] - time.time()
+    return max(0, int(rem))
+
+async def apply_flood_wait(seconds, source="Telegram API"):
+    """
+    Фиксирует задержку FloodWait, высчитывает время окончания и отправляет уведомление через бота.
+    """
+    rate_limiter_state["until"] = time.time() + seconds
+    
+    until_dt = datetime.now() + timedelta(seconds=seconds)
+    until_str = until_dt.strftime("%H:%M:%S")
+
+    mins, secs = divmod(seconds, 60)
+    hours, mins = divmod(mins, 60)
+
+    parts = []
+    if hours > 0:
+        parts.append(f"{hours} ч.")
+    if mins > 0:
+        parts.append(f"{mins} мин.")
+    parts.append(f"{secs} сек.")
+    duration_str = " ".join(parts)
+
+    notify_text = (
+        f"⚠️ **Внимание: Сработало ограничение Telegram API (FloodWait)!**\n\n"
+        f"⏱ **Длительность:** `{duration_str}` (`{seconds} сек.`)\n"
+        f"⏳ **Ограничение спадёт в:** `{until_str}`\n"
+        f"📌 **Источник:** {source}\n\n"
+        f"🤖 Юзербот временно заблокировал отправку новых запросов, чтобы предотвратить спамбан и сброс сессии."
+    )
+    print(f"[RateLimiter] ⚠️ Зафиксирован FloodWait на {seconds} сек. (до {until_str})")
+    await send_bot_notification(notify_text)
+
+async def check_cmd_rate_limit():
+    """
+    Проактивная проверка перед отправкой команды:
+    - Задерживает выполнение на min_interval, если команды идут слишком часто
+    - Если действует FloodWait, генерирует исключение
+    """
+    if is_rate_limited():
+        rem = get_rate_limit_remaining()
+        raise PermissionError(f"Действует ограничение Telegram (FloodWait). Запросы заблокированы ещё на {rem} сек.")
+
+    now = time.time()
+    elapsed = now - rate_limiter_state["last_cmd_time"]
+    if elapsed < rate_limiter_state["min_interval"]:
+        await asyncio.sleep(rate_limiter_state["min_interval"] - elapsed)
+    rate_limiter_state["last_cmd_time"] = time.time()
 
 # --- СИСТЕМА КОНФИГУРАЦИЙ ---
 CONFIG_FILE = "Global_config.json"
@@ -269,6 +334,9 @@ async def send_inline(client, chat_id, text, buttons=None, reply_to=None):
         results = await client.inline_query(bot_username, payload_id)
         if results:
             return await results[0].click(chat_id, reply_to=reply_to)
+    except errors.FloodWaitError as e:
+        await apply_flood_wait(e.seconds, source="send_inline")
+        raise e
     except Exception as e:
         print(f"[Registry] Ошибка отправки inline-сообщения: {e}")
         raise e

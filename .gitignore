@@ -1,8 +1,11 @@
 modules/
 my_account.session
 my_account.session-journal
+Global_config.json
 Global_Config.json
 core_conf.json
 bot_config.json
+restart_info.json
 bot_session.session
 bot_session.session-journal
+__pycache__/

@@ -25,18 +25,56 @@ from registry import (
     send_bot_notification,
     callback_handlers,
     inline_payload_cache,
-    save_restart_info
+    save_restart_info,
+    is_rate_limited,
+    get_rate_limit_remaining,
+    apply_flood_wait,
+    check_cmd_rate_limit
 )
-
-proxy_config = {
-    'proxy_type': 'http',
-    'addr': '127.0.0.1',
-    'port': 2080
-}
 
 # --- НАСТРОЙКИ КОНФИГА ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "core_conf.json")
+
+def get_proxy_config(config):
+    """
+    Извлекает настройки прокси из конфигурации ядра (core_conf.json).
+    Прокси не обязателен. Если прокси не задан в конфиге или выключен, возвращает None.
+    """
+    if not isinstance(config, dict):
+        return None
+
+    proxy = config.get("proxy")
+    if not proxy or not isinstance(proxy, dict):
+        return None
+
+    addr = proxy.get("addr")
+    port = proxy.get("port")
+    
+    if not addr or port is None:
+        return None
+
+    try:
+        port = int(port)
+    except (ValueError, TypeError):
+        return None
+
+    proxy_type = str(proxy.get("proxy_type", "http")).lower()
+
+    proxy_dict = {
+        'proxy_type': proxy_type,
+        'addr': str(addr),
+        'port': port
+    }
+
+    if proxy.get("username"):
+        proxy_dict['username'] = str(proxy.get("username"))
+    if proxy.get("password"):
+        proxy_dict['password'] = str(proxy.get("password"))
+    if "rdns" in proxy:
+        proxy_dict['rdns'] = bool(proxy.get("rdns"))
+
+    return proxy_dict
 
 def load_or_create_config():
     """Загружает конфиг core_conf.json, а если его нет - запрашивает данные у пользователя и создает."""
@@ -68,9 +106,44 @@ def load_or_create_config():
         "app_id": app_id,
         "hash_id": hash_id
     }
+
+    print("\n💡 Настройка юзернейма встроенного Telegram бота.")
+    print("   Оставьте пустым (нажмите Enter) для авто-поиска или случайной генерации.")
+    desired_bot_un = input("Введите желаемый юзернейм бота (например, my_cool_ub_bot) [Enter — авто]: ").strip()
+    if desired_bot_un:
+        config_data["desired_bot_username"] = desired_bot_un.lstrip("@")
+
+    use_proxy = input("\nХотите настроить прокси? (y/N): ").strip().lower()
+    if use_proxy in ['y', 'yes', 'да', 'д']:
+        proxy_type = input("Тип прокси (http/socks5/socks4) [по умолчанию http]: ").strip().lower() or "http"
+        addr = input("Адрес прокси (например, 127.0.0.1): ").strip()
+        while True:
+            try:
+                port_str = input("Порт прокси: ").strip()
+                if not port_str:
+                    print("❌ Ошибка: порт не может быть пустым.")
+                    continue
+                port = int(port_str)
+                break
+            except ValueError:
+                print("❌ Ошибка: порт должен быть числом.")
+        username = input("Логин прокси (оставьте пустым, если не требуется): ").strip()
+        password = input("Пароль прокси (оставьте пустым, если не требуется): ").strip()
+
+        proxy_dict = {
+            "proxy_type": proxy_type,
+            "addr": addr,
+            "port": port
+        }
+        if username:
+            proxy_dict["username"] = username
+        if password:
+            proxy_dict["password"] = password
+
+        config_data["proxy"] = proxy_dict
     
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(config_data, f, indent=4)
+        json.dump(config_data, f, indent=4, ensure_ascii=False)
         
     print(f"[Core] ✅ Настройки успешно сохранены в файл {CONFIG_FILE}!\n")
     return config_data
@@ -84,8 +157,14 @@ def save_core_config(config_data):
 raw_config = load_or_create_config()
 API_ID = int(raw_config["app_id"])
 API_HASH = raw_config["hash_id"]
+proxy_config = get_proxy_config(raw_config)
 
-# Инициализируем юзербот клиента (тут прокси был настроен изначально)
+if proxy_config:
+    print(f"[Core] 🌐 Используется прокси ({proxy_config['proxy_type']}://{proxy_config['addr']}:{proxy_config['port']})")
+else:
+    print("[Core] 🌐 Прокси не используется (не прописан в конфиге)")
+
+# Инициализируем юзербот клиента
 client = TelegramClient(
     'my_account',
     API_ID,
@@ -99,64 +178,163 @@ client = TelegramClient(
 async def auto_setup_bot(userbot_client, me):
     """
     Проверяет наличие токена бота в core_conf.json.
-    Если его нет — сам обращается к @BotFather, создаёт бота, включает inline и сохраняет токен.
+    Если его нет — обращается к @BotFather:
+    1. Пробует создать бота с указанным пользователем юзернеймом (если был введён).
+    2. Если юзернейм занят/не указан — ищет существующего бота юзербота (/token).
+    3. Если подхоящий бот не найден — создаёт нового бота со случайным юзернеймом.
     """
     config = load_or_create_config()
     bot_token = config.get("bot_token")
     bot_username = config.get("bot_username")
     is_first_run = config.get("is_first_run", True)
+    desired_username = config.get("desired_bot_username")
 
     if bot_token and bot_username:
         return bot_token, bot_username, is_first_run
 
     print("\n[Core] 🤖 Настройка встроенного Telegram Бота...")
-    print("[Core] Пытаемся автоматически создать бота через @BotFather...")
+    print("[Core] Подключаемся к @BotFather...")
 
     try:
         bf_entity = await userbot_client.get_input_entity("BotFather")
-        async with userbot_client.conversation(bf_entity, timeout=15) as conv:
-            # 1. Отправляем /newbot
-            await conv.send_message("/newbot")
-            resp = await conv.get_response()
+        async with userbot_client.conversation(bf_entity, timeout=30) as conv:
+            found_token = None
+            found_username = None
 
-            if "name for your bot" in resp.text or "How are we going to call it" in resp.text or "new bot" in resp.text.lower():
-                # 2. Имя бота
-                bot_name = f"{me.first_name}'s Assistant"
-                await conv.send_message(bot_name)
+            # --- ЭТАП 1: Попытка создания с указанным юзернеймом ---
+            if desired_username:
+                target_un = desired_username
+                if not target_un.lower().endswith("bot"):
+                    target_un = f"{target_un}_bot"
+
+                print(f"[Core] 🎯 Пытаемся создать бота с указанным юзернеймом: @{target_un}...")
+                await conv.send_message("/newbot")
                 resp = await conv.get_response()
 
-                # 3. Юзернейм бота
-                base_un = (me.username or f"user_{me.id}").lower()
-                suffix = random.randint(1000, 9999)
-                target_username = f"{base_un}_ub_{suffix}_bot"
-                await conv.send_message(target_username)
+                if any(phrase in resp.text.lower() for phrase in ["name for your bot", "how are we going to call it", "new bot"]):
+                    bot_name = f"{me.first_name}'s Assistant"
+                    await conv.send_message(bot_name)
+                    resp = await conv.get_response()
+
+                    await conv.send_message(target_un)
+                    resp = await conv.get_response()
+
+                    match = re.search(r"(\d+:[A-Za-z0-9_-]+)", resp.text)
+                    if match:
+                        found_token = match.group(1)
+                        found_username = target_un
+                        print(f"[Core] 🎉 Успешно создан бот с указанным юзернеймом @{found_username}!")
+                    else:
+                        print(f"[Core] ⚠️ Юзернейм @{target_un} занят или недоступен.")
+                        print("[Core] 🔄 Сбрасываем диалог и переходим к авто-поиску/созданию со случайным юзернеймом...")
+                        await conv.send_message("/cancel")
+                        try:
+                            await conv.get_response()
+                        except Exception:
+                            pass
+
+            # --- ЭТАП 2: Поиск существующего подходящего бота ---
+            if not found_token:
+                print("[Core] 🔍 Проверяем наличие существующих ботов...")
+                await conv.send_message("/token")
                 resp = await conv.get_response()
 
-                match = re.search(r"(\d+:[A-Za-z0-9_-]+)", resp.text)
-                if match:
-                    bot_token = match.group(1)
-                    bot_username = target_username
-                    print(f"[Core] 🎉 Бот @{bot_username} успешно создан через @BotFather!")
+                no_bots_keywords = ["don't have any", "no bots", "у вас нет", "нет ботов", "you have no"]
+                has_no_bots = any(kw in resp.text.lower() for kw in no_bots_keywords)
 
-                    # 4. Включаем inline режим
+                if not has_no_bots:
+                    candidate_bots = []
+
+                    if resp.buttons:
+                        for row_idx, row in enumerate(resp.buttons):
+                            for col_idx, btn in enumerate(row):
+                                btn_text = btn.text or ""
+                                m = re.search(r"@?([A-Za-z0-9_]+_bot)", btn_text, re.IGNORECASE)
+                                if m:
+                                    candidate_bots.append((m.group(1), btn))
+
+                    if not candidate_bots:
+                        for m in re.finditer(r"@([A-Za-z0-9_]+_bot)", resp.text, re.IGNORECASE):
+                            candidate_bots.append((m.group(1), None))
+
+                    if candidate_bots:
+                        # Ищем бота, предназначенного именно для юзербота (содержащего _ub_, userbot или assistant)
+                        chosen = None
+                        for b in candidate_bots:
+                            un_lower = b[0].lower()
+                            if "_ub_" in un_lower or "userbot" in un_lower or "assistant" in un_lower:
+                                chosen = b
+                                break
+
+                        if chosen:
+                            target_username, btn_obj = chosen
+                            print(f"[Core] 💡 Найден подходящий бот юзербота: @{target_username}")
+
+                            if btn_obj is not None:
+                                try:
+                                    await btn_obj.click()
+                                except Exception:
+                                    await conv.send_message(f"@{target_username}")
+                            else:
+                                await conv.send_message(f"@{target_username}")
+
+                            token_resp = await conv.get_response()
+                            match = re.search(r"(\d+:[A-Za-z0-9_-]+)", token_resp.text)
+                            if match:
+                                found_token = match.group(1)
+                                found_username = target_username
+                                print(f"[Core] ✅ Успешно получен токен для существующего бота @{found_username}")
+                        else:
+                            print("[Core] ℹ️ Подходящих ботов для юзербота не найдено среди существующих.")
+
+            # --- ЭТАП 3: Создание нового бота со случайным юзернеймом ---
+            if not found_token:
+                print("[Core] ➕ Создаем нового бота со случайным юзернеймом...")
+                await conv.send_message("/newbot")
+                resp = await conv.get_response()
+
+                if any(phrase in resp.text.lower() for phrase in ["name for your bot", "how are we going to call it", "new bot"]):
+                    bot_name = f"{me.first_name}'s Assistant"
+                    await conv.send_message(bot_name)
+                    resp = await conv.get_response()
+
+                    base_un = (me.username or f"user_{me.id}").lower()
+                    suffix = random.randint(1000, 9999)
+                    target_username = f"{base_un}_ub_{suffix}_bot"
+                    await conv.send_message(target_username)
+                    resp = await conv.get_response()
+
+                    match = re.search(r"(\d+:[A-Za-z0-9_-]+)", resp.text)
+                    if match:
+                        found_token = match.group(1)
+                        found_username = target_username
+                        print(f"[Core] 🎉 Новый бот @{found_username} успешно создан через @BotFather!")
+
+            # --- ЭТАП 3: Настройка Inline-режима ---
+            if found_token and found_username:
+                try:
                     await conv.send_message("/setinline")
-                    await conv.get_response()
-                    await conv.send_message(f"@{bot_username}")
-                    await conv.get_response()
-                    await conv.send_message("Search")
-                    await conv.get_response()
+                    setinline_resp = await conv.get_response()
+                    if any(w in setinline_resp.text.lower() for w in ["choose a bot", "выберите бота", "which bot"]):
+                        await conv.send_message(f"@{found_username}")
+                        setinline_resp = await conv.get_response()
 
-                    # Сохраняем в конфиг
-                    config["bot_token"] = bot_token
-                    config["bot_username"] = bot_username
-                    config["is_first_run"] = True
-                    save_core_config(config)
-                    return bot_token, bot_username, True
+                    if any(w in setinline_resp.text.lower() for w in ["placeholder", "текст", "label", "empty inline"]):
+                        await conv.send_message("Search")
+                        await conv.get_response()
+                except Exception as ex_inline:
+                    print(f"[Core] ⚠️ Внимание при проверке inline режима: {ex_inline}")
+
+                config["bot_token"] = found_token
+                config["bot_username"] = found_username
+                config["is_first_run"] = True
+                save_core_config(config)
+                return found_token, found_username, True
 
     except Exception as e:
-        print(f"[Core] ⚠️ Не удалось автоматически создать бота через @BotFather: {e}")
+        print(f"[Core] ⚠️ Не удалось автоматически настроить бота через @BotFather: {e}")
 
-    # Фолбэк: если автоматическое создание не сработало, просим ввод токена ручками
+    # Фолбэк: если автонастройка не сработало, просим ввод токена ручками
     print("\n" + "="*50)
     print("=== НАСТРОЙКА ВСТРОЕННОГО ТЕЛЕГРАМ БОТА ===")
     print("Создайте бота через @BotFather и вставьте его токен ниже.")
@@ -164,7 +342,7 @@ async def auto_setup_bot(userbot_client, me):
 
     bot_token = input("Введите Bot Token (например: 123456789:ABC...): ").strip()
     
-    # Извлекаем username бота через временный клиент в оперативной памяти (Добавлен прокси!)
+    # Извлекаем username бота через временный клиент в оперативной памяти
     temp_bot = TelegramClient(MemorySession(), API_ID, API_HASH, proxy=proxy_config)
     await temp_bot.start(bot_token=bot_token)
     temp_me = await temp_bot.get_me()
@@ -255,9 +433,29 @@ async def handle_incoming_messages(event):
         print(f"[Debug] Обнаружена команда: .{cmd} с аргументами: '{args}'")
 
         if cmd in modules_repo["commands"]:
+            if is_rate_limited():
+                rem = get_rate_limit_remaining()
+                mins, secs = divmod(rem, 60)
+                await event.edit(
+                    f"⚠️ **Запросы к Telegram API временно ограничены!**\n"
+                    f"⏱ Осталось подождать: `{rem} сек.` (`{mins}м {secs}с`)\n"
+                    f"🤖 Уведомление об ограничении отправлено от лица бота."
+                )
+                return
+
             try:
+                await check_cmd_rate_limit()
                 await modules_repo["commands"][cmd](client, event, args)
                 print(f"[Debug] Команда .{cmd} успешно выполнена!")
+            except errors.FloodWaitError as e:
+                print(f"[Core] ⚠️ Пойман FloodWaitError: {e.seconds} сек.")
+                await apply_flood_wait(e.seconds, source=f"Команда .{cmd}")
+                await event.edit(
+                    f"⚠️ **Сработало ограничение Telegram API (FloodWait):** `{e.seconds} сек.`\n"
+                    f"🤖 Уведомление с подробностями отправлено от лица бота."
+                )
+            except PermissionError as pe:
+                await event.edit(f"⚠️ {pe}")
             except Exception as e:
                 print(f"[Debug] ❌ Ошибка при выполнении .{cmd}: {e}")
                 await event.edit(f"**Ошибка в модуле [.{cmd}]:**\n`{e}`")
@@ -417,7 +615,6 @@ async def main():
     # Инициализация и автонастройка встроенного Telegram Бота
     bot_token, bot_username, is_first_run = await auto_setup_bot(client, me)
     try:
-        # ДОБАВЛЕН proxy=proxy_config
         bot_client = TelegramClient(
             'bot_session',
             API_ID,
@@ -425,7 +622,7 @@ async def main():
             device_model="MacBook Pro",
             system_version="macOS 14.5",
             app_version="10.11.1",
-            proxy=proxy_config 
+            proxy=proxy_config
         )
         await bot_client.start(bot_token=bot_token)
     except Exception as e:
@@ -436,7 +633,6 @@ async def main():
             except Exception:
                 pass
         
-        # ДОБАВЛЕН proxy=proxy_config и здесь тоже
         bot_client = TelegramClient(
             'bot_session',
             API_ID,
@@ -444,7 +640,7 @@ async def main():
             device_model="MacBook Pro",
             system_version="macOS 14.5",
             app_version="10.11.1",
-            proxy=proxy_config 
+            proxy=proxy_config
         )
         await bot_client.start(bot_token=bot_token)
         

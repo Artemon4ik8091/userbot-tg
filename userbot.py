@@ -24,7 +24,7 @@ if "--help" in sys.argv or "-h" in sys.argv:
   --set-proxy-ip <строка>     Установить IP-адрес прокси (например, 127.0.0.1)
   --set-proxy-port <число>    Установить порт прокси (например, 1080)
   --set-proxy-protocol <тип>  Установить протокол прокси (доступны: http, socks4, socks5)
-  --host                      Режим хостинга (отключает загрузку локального installer.py)
+  --host                      Режим хостинга (отключает загрузку локальных installer.py и terminal.py)
 """)
     sys.exit(0)
 
@@ -294,9 +294,9 @@ def load_modules():
             if file.endswith('.py') and not file.startswith('__'):
                 module_name = file[:-3]
                 
-                # Игнорируем installer.py, если запущен с флагом --host
-                if module_name == "installer" and "--host" in sys.argv:
-                    print("[Core] ⏭ Пропуск модуля 'installer' (активен флаг --host)")
+                # Игнорируем installer.py и terminal.py, если запущен с флагом --host
+                if module_name in ("installer", "terminal") and "--host" in sys.argv:
+                    print(f"[Core] ⏭ Пропуск модуля '{module_name}' (активен флаг --host)")
                     continue
                     
                 try:

@@ -4,7 +4,7 @@ import re
 import asyncio
 import importlib
 import traceback
-from registry import register_cmd, set_module_meta, modules_repo
+from registry import register_cmd, set_module_meta, modules_repo, save_restart_info
 
 # Обновляем метаданные модуля (он системный, удалять нельзя)
 set_module_meta(
@@ -116,8 +116,20 @@ async def install_module(client, event, args):
                 await asyncio.sleep(1)
 
         if imported_successfully:
-            await event.edit(f"✅ Модуль `{module_name}` успешно установлен, все зависимости на месте!")
-            print(f"[Installer] Модуль {module_name} успешно установлен.")
+            await event.edit(f"⏳ `Подготовка и настройка модуля {module_name}...`")
+            print(f"[Installer] Модуль {module_name} успешно установлен. Применение настроек...")
+            
+            success_text = f"✅ **Модуль `{module_name}` успешно установлен и готов к работе!**"
+            save_restart_info(event.chat_id, event.id, custom_text=success_text)
+
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
+            python = sys.executable
+            script = os.path.abspath(sys.argv[0])
+            os.execv(python, [python, script] + sys.argv[1:])
         else:
             await event.edit(f"❌ Ошибка: Превышено число попыток автоустановки зависимостей для `{module_name}`.")
         

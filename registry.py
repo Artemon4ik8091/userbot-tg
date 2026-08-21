@@ -200,9 +200,9 @@ def is_system_module(module_id):
 # сообщение, куда нужно отправить подтверждение об успешном рестарте.
 RESTART_FILE = "restart_info.json"
 
-def save_restart_info(chat_id, message_id):
+def save_restart_info(chat_id, message_id, custom_text=None):
     """
-    Сохраняет данные о том, где было вызвано .restart, чтобы после
+    Сохраняет данные о том, где было вызвано .restart или .update, чтобы после
     перезапуска процесса ядро могло отредактировать это же сообщение.
     """
     data = {
@@ -210,6 +210,8 @@ def save_restart_info(chat_id, message_id):
         "message_id": message_id,
         "time": time.time()
     }
+    if custom_text:
+        data["custom_text"] = custom_text
     try:
         with open(RESTART_FILE, 'w', encoding='utf-8') as f:
             json.dump(data, f)

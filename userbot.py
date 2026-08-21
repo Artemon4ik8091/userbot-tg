@@ -318,7 +318,11 @@ async def notify_after_restart():
     if not restart_info: return
     try:
         elapsed = time.time() - restart_info.get("time", time.time())
-        text = f"✅ **Успешно перезагружен!**\n⏱ Заняло: `{elapsed:.2f} сек.`"
+        custom_text = restart_info.get("custom_text")
+        if custom_text:
+            text = f"{custom_text}\n⏱ Заняло: `{elapsed:.2f} сек.`"
+        else:
+            text = f"✅ **Успешно перезагружен!**\n⏱ Заняло: `{elapsed:.2f} сек.`"
         await client.edit_message(restart_info["chat_id"], restart_info["message_id"], text)
         await send_bot_notification(text)
     except Exception as e: pass

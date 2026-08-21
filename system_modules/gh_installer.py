@@ -7,7 +7,7 @@ import traceback
 import json
 import aiohttp
 import time
-from registry import register_cmd, set_module_meta, modules_repo
+from registry import register_cmd, set_module_meta, modules_repo, save_restart_info
 
 # Обновляем метаданные модуля (он системный, удалять нельзя)
 set_module_meta(
@@ -147,16 +147,28 @@ async def upgrade_cmd(client, event, args):
             except Exception as e:
                 errors.append(f"{alias} ({type(e).__name__})")
     
-    msg = f"✅ **Обновление модулей завершено!**\n\n"
     if upgraded:
+        await event.edit("⏳ `Подготовка и применение обновленных модулей...`")
+        msg = f"✅ **Обновление модулей завершено!**\n\n"
         msg += f"🔝 **Обновлено ({len(upgraded)}):** `{', '.join(upgraded)}`\n"
-    else:
-        msg += "🤷‍♂️ **Нет модулей для обновления.** (Ни один модуль из репозитория не установлен)\n"
+        if errors:
+            msg += f"⚠️ **Ошибки ({len(errors)}):** `{', '.join(errors)}`\n"
+        msg += "\n*(Совет: используй `.fixreq`, если после обновления модули выдают ошибки)*"
         
+        save_restart_info(event.chat_id, event.id, custom_text=msg)
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+        python = sys.executable
+        script = os.path.abspath(sys.argv[0])
+        os.execv(python, [python, script] + sys.argv[1:])
+        return
+
+    msg = "🤷‍♂️ **Нет модулей для обновления.** (Ни один модуль из репозитория не установлен)\n"
     if errors:
         msg += f"⚠️ **Ошибки ({len(errors)}):** `{', '.join(errors)}`\n"
-        
-    msg += "\n*(Совет: используй `.fixreq`, если после обновления модули выдают ошибки)*"
     await event.edit(msg)
 
 @register_cmd("fixreq", desc="Проверить и доустановить зависимости pip для всех локальных модулей")
@@ -334,7 +346,20 @@ async def install_module(client, event, args):
                 await asyncio.sleep(1)
 
         if imported_successfully:
-            await event.edit(f"✅ Пакет `{package_alias}` (`{module_name}`) успешно установлен и запущен!")
+            await event.edit(f"⏳ `Подготовка и настройка пакета {package_alias}...`")
+            print(f"[GH-Installer] Пакет {package_alias} ({module_name}) установлен. Применение настроек...")
+            
+            success_text = f"✅ **Пакет `{package_alias}` (`{module_name}`) успешно установлен и готов к работе!**"
+            save_restart_info(event.chat_id, event.id, custom_text=success_text)
+
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
+            python = sys.executable
+            script = os.path.abspath(sys.argv[0])
+            os.execv(python, [python, script] + sys.argv[1:])
         else:
             await event.edit(f"❌ Ошибка: Не удалось запустить `{module_name}`.")
             

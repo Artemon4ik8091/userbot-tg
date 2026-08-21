@@ -12,7 +12,10 @@ from registry import (
     send_inline,
     get_bot,
     get_owner_id,
-    get_bot_username
+    get_bot_username,
+    get_config,
+    set_config,
+    init_config
 )
 
 # Системный модуль обновления юзербота (удалять нельзя)
@@ -21,6 +24,10 @@ set_module_meta(
     desc="Системный модуль обновления юзербота из официального GitHub репозитория с инлайн-кнопками и фоновым чекером.",
     system=True
 )
+
+init_config("module_update", {
+    "snoozed_hash": ""
+})
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OFFICIAL_REPO_URL = "https://github.com/Artemon4ik8091/userbot-tg"
@@ -342,6 +349,7 @@ async def run_update_sequence(client, chat_id, message_id, branch, force=False, 
 
     await update_status("🔄 Перезапускаю юзербота для применения всех изменений...")
     save_restart_info(chat_id, message_id, restart_text)
+    set_config("module_update", "snoozed_hash", "")
 
     # 5. Корректное закрытие сессий и перезапуск
     if client:
@@ -456,9 +464,20 @@ async def cb_bot_upd_snooze(event, data):
     if not is_authorized_user(sender.id):
         return await event.answer("⚠️ Действие доступно только владельцу!", alert=True)
 
-    await event.answer("⏳ Отложено")
+    # Извлекаем хэш версии из callback_data или запрашиваем актуальный
+    snoozed_hash = data.replace("bot_upd_snooze_", "").replace("bot_upd_snooze", "").strip("_")
+    if not snoozed_hash:
+        branch = await get_current_branch()
+        _, remote_hash, _ = await run_git_cmd("rev-parse", f"origin/{branch}")
+        snoozed_hash = remote_hash
+
+    if snoozed_hash:
+        set_config("module_update", "snoozed_hash", snoozed_hash)
+
+    await event.answer("⏳ Обновление отложено")
     hint_text = (
         "⏳ **Обновление отложено.**\n\n"
+        "Бот больше не будет напоминать об этой версии (до выхода следующего нового обновления).\n\n"
         "💡 **Подсказка:** Чтобы обновиться в любое время, "
         "используйте команду `.update` в любом чате или нажмите кнопку ниже."
     )
@@ -496,7 +515,20 @@ async def auto_update_checker(client):
                     code_cnt, behind_str, _ = await run_git_cmd("rev-list", "--count", f"HEAD..origin/{branch}")
                     behind_count = int(behind_str) if (code_cnt == 0 and behind_str.isdigit()) else 0
 
-                    if behind_count > 0 and remote_hash and remote_hash != last_notified_hash and remote_hash != local_hash:
+                    snoozed_hash = get_config("module_update", "snoozed_hash", "")
+
+                    # Проверяем:
+                    # 1. Есть коммиты позади (behind_count > 0)
+                    # 2. remote_hash валидный и не равен локальному
+                    # 3. remote_hash не совпадает с отложенной версией (snoozed_hash)
+                    # 4. remote_hash еще не был отправлен в текущей сессии (last_notified_hash)
+                    if (
+                        behind_count > 0
+                        and remote_hash
+                        and remote_hash != local_hash
+                        and remote_hash != snoozed_hash
+                        and remote_hash != last_notified_hash
+                    ):
                         code_log, new_commits_log, _ = await run_git_cmd(
                             "log",
                             f"HEAD..origin/{branch}",
@@ -520,7 +552,7 @@ async def auto_update_checker(client):
                         buttons = [
                             [
                                 Button.inline("🚀 Обновить", b"bot_upd_apply"),
-                                Button.inline("⏳ Отложить", b"bot_upd_snooze")
+                                Button.inline("⏳ Отложить", f"bot_upd_snooze_{remote_hash}".encode())
                             ]
                         ]
 

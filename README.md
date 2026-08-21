@@ -376,35 +376,24 @@ async def _update_counter(event, cid):
 
 ## **10. Система перезагрузки и сохранения контекста**
 
-Если вашему модулю требуется перезапустить юзербота (например, после обновления, изменения критических настроек или установки библиотек), используйте механизм сохранения контекста через `save_restart_info`:
+Если вашему модулю требуется перезапустить юзербота (например, после обновления, изменения настроек или установки библиотек), используйте функцию `restart_userbot` из реестра:
 
 ```python
-import os
-import sys
-from registry import save_restart_info
+from registry import restart_userbot
 
-# 1. Сохраняем чат, ID сообщения и опциональный кастомный текст для отчёта
-save_restart_info(
+# Полная перезагрузка юзербота с сохранением контекста сообщения
+await restart_userbot(
+    client=client,
     chat_id=event.chat_id,
     message_id=event.id,
     custom_text="🎉 **Модуль успешно обновлен и готов к работе!**"
 )
-
-# 2. Корректно закрываем сессию Telegram
-try:
-    await client.disconnect()
-except Exception:
-    pass
-
-# 3. Полный перезапуск Python-процесса
-python = sys.executable
-script = os.path.abspath(sys.argv[0])
-os.execv(python, [python, script] + sys.argv[1:])
 ```
 
-### **Параметры `save_restart_info`:**
-- `chat_id` *(int)*: ID чата, где была вызвана команда.
-- `message_id` *(int)*: ID сообщения, которое будет отредактировано после рестарта.
+### **Параметры `restart_userbot`:**
+- `client` *(TelegramClient, optional)*: Клиент юзербота для корректного отключения сессии.
+- `chat_id` *(int, optional)*: ID чата, где была вызвана команда.
+- `message_id` *(int, optional)*: ID сообщения, которое будет отредактировано после рестарта.
 - `custom_text` *(str, optional)*: Текст, который ядро подставит после успешного запуска. Если `None`, выводится стандартное `✅ Успешно перезагружен! (Заняло: X.XX сек.)`.
 
 ---

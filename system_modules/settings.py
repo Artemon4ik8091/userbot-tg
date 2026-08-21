@@ -3,7 +3,7 @@ import sys
 import json
 import re
 import asyncio
-from registry import register_cmd, set_module_meta, save_restart_info
+from registry import register_cmd, set_module_meta, restart_userbot
 
 # Системный модуль управления настройками ядра и встроенного бота
 set_module_meta(
@@ -105,22 +105,10 @@ async def reset_token_cmd(client, event, args):
             msg_text = (
                 f"✅ **Токен бота @{bot_username} успешно сброшен!**\n\n"
                 f"🔑 **Новый токен:** `{new_token}`\n"
-                f"⚙️ Обновлено в `core_conf.json`.\n\n"
-                f"🔄 Перезапускаем юзербота для привязки нового токена..."
+                f"⚙️ Обновлено в `core_conf.json`."
             )
-            await event.edit(msg_text)
-            await asyncio.sleep(1)
-
-            # Сохраняем данные рестарта, чтобы при перезапуске обновить сообщение
-            save_restart_info(event.chat_id, event.id)
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
-
-            python = sys.executable
-            script = os.path.abspath(sys.argv[0])
-            os.execv(python, [python, script] + sys.argv[1:])
+            await event.edit(f"{msg_text}\n\n🔄 Перезапускаем юзербота для привязки нового токена...")
+            await restart_userbot(client, event.chat_id, event.id, custom_text=msg_text)
 
         else:
             await event.edit(f"❌ **Не удалось извлечь новый токен от @BotFather.**\nОтвет: `{resp.text}`")

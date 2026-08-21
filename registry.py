@@ -2,6 +2,7 @@
 import inspect
 import json
 import os
+import sys
 import time
 import asyncio
 from datetime import datetime, timedelta
@@ -237,6 +238,31 @@ def pop_restart_info():
         except OSError:
             pass
     return data
+
+async def restart_userbot(client=None, chat_id=None, message_id=None, custom_text=None):
+    """
+    Выполняет полную перезагрузку юзербота (полный перезапуск Python-процесса точно так же, как модуль restart).
+    Сохраняет данные для восстановления контекста/редактирования исходного сообщения после перезапуска.
+    """
+    if chat_id is not None and message_id is not None:
+        save_restart_info(chat_id, message_id, custom_text=custom_text)
+
+    if client:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+    bot = get_bot()
+    if bot:
+        try:
+            await bot.disconnect()
+        except Exception:
+            pass
+
+    python = sys.executable
+    script = os.path.abspath(sys.argv[0])
+    os.execv(python, [python, script] + sys.argv[1:])
 
 
 # --- ХРАНИЛИЩЕ БОТА, ВЛАДЕЛЬЦА И ИНЛАЙН ИНФРАСТРУКТУРЫ ---

@@ -42,6 +42,7 @@ from registry import (
     callback_handlers,
     inline_payload_cache,
     save_restart_info,
+    restart_userbot,
     is_rate_limited,
     get_rate_limit_remaining,
     apply_flood_wait,
@@ -413,11 +414,8 @@ def setup_core_bot_handlers(bot_client):
         elif text.startswith("/status"): await send_bot_status_msg(event)
         elif text.startswith("/ping"): await event.respond("🏓 ПОНГ!")
         elif text.startswith("/restart"):
-            await event.respond("🔄 **Перезапуск...**")
-            save_restart_info(event.chat_id, event.id)
-            try: await client.disconnect()
-            except: pass
-            os.execv(sys.executable, [sys.executable, os.path.abspath(sys.argv[0])] + sys.argv[1:])
+            msg = await event.respond("🔄 **Перезапуск...**")
+            await restart_userbot(client, event.chat_id, msg.id)
 
 async def main():
     await client.connect()

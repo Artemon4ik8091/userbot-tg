@@ -7,7 +7,7 @@ import traceback
 import json
 import aiohttp
 import time
-from registry import register_cmd, set_module_meta, modules_repo, save_restart_info
+from registry import register_cmd, set_module_meta, modules_repo, restart_userbot
 
 # Обновляем метаданные модуля (он системный, удалять нельзя)
 set_module_meta(
@@ -155,15 +155,7 @@ async def upgrade_cmd(client, event, args):
             msg += f"⚠️ **Ошибки ({len(errors)}):** `{', '.join(errors)}`\n"
         msg += "\n*(Совет: используй `.fixreq`, если после обновления модули выдают ошибки)*"
         
-        save_restart_info(event.chat_id, event.id, custom_text=msg)
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
-
-        python = sys.executable
-        script = os.path.abspath(sys.argv[0])
-        os.execv(python, [python, script] + sys.argv[1:])
+        await restart_userbot(client, event.chat_id, event.id, custom_text=msg)
         return
 
     msg = "🤷‍♂️ **Нет модулей для обновления.** (Ни один модуль из репозитория не установлен)\n"
@@ -350,16 +342,7 @@ async def install_module(client, event, args):
             print(f"[GH-Installer] Пакет {package_alias} ({module_name}) установлен. Применение настроек...")
             
             success_text = f"✅ **Пакет `{package_alias}` (`{module_name}`) успешно установлен и готов к работе!**"
-            save_restart_info(event.chat_id, event.id, custom_text=success_text)
-
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
-
-            python = sys.executable
-            script = os.path.abspath(sys.argv[0])
-            os.execv(python, [python, script] + sys.argv[1:])
+            await restart_userbot(client, event.chat_id, event.id, custom_text=success_text)
         else:
             await event.edit(f"❌ Ошибка: Не удалось запустить `{module_name}`.")
             
@@ -393,7 +376,9 @@ async def uninstall_module(client, event, args):
         os.remove(file_path)
         if module_name in sys.modules:
             del sys.modules[module_name]
-        await event.edit(f"🗑 Модуль `{module_name}` успешно удален!\n*(Рекомендуется сделать `.restart` для очистки памяти)*")
+        await event.edit(f"🗑 Удаляю модуль `{module_name}` и перезагружаю юзербота...")
+        success_text = f"🗑 **Модуль `{module_name}` успешно удален!**"
+        await restart_userbot(client, event.chat_id, event.id, custom_text=success_text)
     except Exception as e:
         await event.edit(f"❌ Ошибка при удалении: {e}")
 

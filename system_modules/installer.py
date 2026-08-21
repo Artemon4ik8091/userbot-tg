@@ -4,7 +4,7 @@ import re
 import asyncio
 import importlib
 import traceback
-from registry import register_cmd, set_module_meta, modules_repo, save_restart_info
+from registry import register_cmd, set_module_meta, modules_repo, restart_userbot
 
 # Обновляем метаданные модуля (он системный, удалять нельзя)
 set_module_meta(
@@ -120,16 +120,7 @@ async def install_module(client, event, args):
             print(f"[Installer] Модуль {module_name} успешно установлен. Применение настроек...")
             
             success_text = f"✅ **Модуль `{module_name}` успешно установлен и готов к работе!**"
-            save_restart_info(event.chat_id, event.id, custom_text=success_text)
-
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
-
-            python = sys.executable
-            script = os.path.abspath(sys.argv[0])
-            os.execv(python, [python, script] + sys.argv[1:])
+            await restart_userbot(client, event.chat_id, event.id, custom_text=success_text)
         else:
             await event.edit(f"❌ Ошибка: Превышено число попыток автоустановки зависимостей для `{module_name}`.")
         
@@ -173,8 +164,10 @@ async def uninstall_module(client, event, args):
         if module_name in sys.modules:
             del sys.modules[module_name]
             
-        await event.edit(f"🗑 Модуль `{module_name}` успешно удален!\n*(Рекомендуется сделать `.restart` для очистки памяти)*")
-        print(f"[Installer] Модуль {module_name} удален.")
+        print(f"[Installer] Модуль {module_name} удален. Перезапуск...")
+        await event.edit(f"🗑 Удаляю модуль `{module_name}` и перезагружаю юзербота...")
+        success_text = f"🗑 **Модуль `{module_name}` успешно удален!**"
+        await restart_userbot(client, event.chat_id, event.id, custom_text=success_text)
     except Exception as e:
         await event.edit(f"❌ Ошибка при удалении: {e}")
 

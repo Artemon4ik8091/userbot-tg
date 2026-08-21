@@ -8,7 +8,7 @@ from registry import (
     register_bg,
     register_callback,
     set_module_meta,
-    save_restart_info,
+    restart_userbot,
     send_inline,
     get_bot,
     get_owner_id,
@@ -348,26 +348,8 @@ async def run_update_sequence(client, chat_id, message_id, branch, force=False, 
     )
 
     await update_status("🔄 Перезапускаю юзербота для применения всех изменений...")
-    save_restart_info(chat_id, message_id, restart_text)
     set_config("module_update", "snoozed_hash", "")
-
-    # 5. Корректное закрытие сессий и перезапуск
-    if client:
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
-
-    bot = get_bot()
-    if bot:
-        try:
-            await bot.disconnect()
-        except Exception:
-            pass
-
-    python = sys.executable
-    script = os.path.abspath(sys.argv[0])
-    os.execv(python, [python, script] + sys.argv[1:])
+    await restart_userbot(client, chat_id, message_id, custom_text=restart_text)
 
 
 # ==========================================

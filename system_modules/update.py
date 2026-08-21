@@ -2,12 +2,23 @@ import os
 import sys
 import shutil
 import asyncio
-from registry import register_cmd, set_module_meta, save_restart_info
+from telethon import Button, errors
+from registry import (
+    register_cmd,
+    register_bg,
+    register_callback,
+    set_module_meta,
+    save_restart_info,
+    send_inline,
+    get_bot,
+    get_owner_id,
+    get_bot_username
+)
 
 # Системный модуль обновления юзербота (удалять нельзя)
 set_module_meta(
     name="Обновление",
-    desc="Системный модуль обновления юзербота из официального GitHub репозитория.",
+    desc="Системный модуль обновления юзербота из официального GitHub репозитория с инлайн-кнопками и фоновым чекером.",
     system=True
 )
 
@@ -140,13 +151,405 @@ async def get_commit_info(revision="HEAD"):
     return None
 
 
+async def check_updates_state():
+    """
+    Выполняет проверку обновлений через fetch и сравнение HEAD с origin/branch.
+    Возвращает словарь с результатами проверки.
+    """
+    ready, err = await ensure_git_setup()
+    if not ready:
+        return {"ok": False, "error": err}
+
+    branch = await get_current_branch()
+    code, _, fetch_err = await run_git_cmd("fetch", "origin", branch, timeout=30)
+    if code != 0:
+        return {"ok": False, "error": f"Не удалось связаться с GitHub (`git fetch`):\n`{fetch_err}`"}
+
+    code_behind, behind_count_str, _ = await run_git_cmd("rev-list", "--count", f"HEAD..origin/{branch}")
+    behind_count = int(behind_count_str) if (code_behind == 0 and behind_count_str.isdigit()) else 0
+
+    code_ahead, ahead_count_str, _ = await run_git_cmd("rev-list", "--count", f"origin/{branch}..HEAD")
+    ahead_count = int(ahead_count_str) if (code_ahead == 0 and ahead_count_str.isdigit()) else 0
+
+    current_commit = await get_commit_info("HEAD")
+
+    new_commits_log = ""
+    if behind_count > 0:
+        code_log, logs_out, _ = await run_git_cmd(
+            "log",
+            f"HEAD..origin/{branch}",
+            "--pretty=format:• `[%h]` **%s** *(%an)*",
+            "-n",
+            "10"
+        )
+        if code_log == 0 and logs_out:
+            new_commits_log = logs_out
+
+    return {
+        "ok": True,
+        "branch": branch,
+        "behind_count": behind_count,
+        "ahead_count": ahead_count,
+        "current_commit": current_commit,
+        "new_commits_log": new_commits_log
+    }
+
+
+def build_update_ui(state):
+    """
+    Формирует текст сообщения и инлайн-кнопки на основе текущего состояния обновлений.
+    """
+    branch = state.get("branch", "main")
+    behind_count = state.get("behind_count", 0)
+    ahead_count = state.get("ahead_count", 0)
+    current_commit = state.get("current_commit")
+    new_commits_log = state.get("new_commits_log", "")
+
+    cur_hash_str = f"`{current_commit['short_hash']}`" if current_commit else "Н/Д"
+    cur_msg_str = current_commit['message'] if current_commit else ""
+    cur_author_str = current_commit['author'] if current_commit else "Неизвестен"
+    cur_date_str = current_commit['date'] if current_commit else ""
+
+    if behind_count > 0:
+        commits_display = new_commits_log or "• Новые изменения в репозитории"
+        if behind_count > 10:
+            commits_display += f"\n*...и еще {behind_count - 10} коммитов*"
+
+        text = (
+            f"📦 **Доступно обновление UBTG!**\n\n"
+            f"🌿 **Ветка:** `{branch}`\n"
+            f"🔢 **Новых коммитов:** `{behind_count}`\n\n"
+            f"📋 **Список изменений:**\n"
+            f"{commits_display}\n\n"
+            f"💡 **Выберите действие:**"
+        )
+        buttons = [
+            [
+                Button.inline("🚀 Обновить", b"upd_apply"),
+                Button.inline("❌ Отмена", b"upd_cancel")
+            ]
+        ]
+        return text, buttons
+
+    elif ahead_count > 0:
+        text = (
+            f"ℹ️ **Локальная версия опережает репозиторий**\n\n"
+            f"🌿 **Ветка:** `{branch}`\n"
+            f"🔢 **Локальных коммитов:** `{ahead_count}`\n"
+            f"📌 **Текущий коммит:** {cur_hash_str} — {cur_msg_str}\n"
+            f"👤 **Автор:** `{cur_author_str}` ({cur_date_str})\n\n"
+            f"💡 Для синхронизации с GitHub можно использовать `.update force`."
+        )
+        buttons = [
+            [
+                Button.inline("🔄 Попробовать снова", b"upd_recheck"),
+                Button.inline("❌ Отмена", b"upd_cancel")
+            ]
+        ]
+        return text, buttons
+
+    else:
+        text = (
+            f"✅ **Юзербот обновлен до последней версии!**\n\n"
+            f"🌿 **Ветка:** `{branch}`\n"
+            f"📌 **Текущий коммит:** {cur_hash_str}\n"
+            f"💬 `{cur_msg_str}`\n"
+            f"👤 **Автор:** `{cur_author_str}` ({cur_date_str})\n\n"
+            f"🔗 [GitHub Репозиторий]({OFFICIAL_REPO_URL})"
+        )
+        buttons = [
+            [Button.inline("🔄 Попробовать снова", b"upd_recheck")]
+        ]
+        return text, buttons
+
+
+async def edit_any_message(client, chat_id, message_id, text, buttons=None):
+    """
+    Универсальное редактирование сообщения через Telegram бота или юзербота.
+    """
+    bot = get_bot()
+    if bot:
+        try:
+            await bot.edit_message(chat_id, message_id, text, buttons=buttons)
+            return True
+        except Exception:
+            pass
+
+    if client:
+        try:
+            await client.edit_message(chat_id, message_id, text, buttons=buttons)
+            return True
+        except Exception:
+            pass
+
+    return False
+
+
+async def run_update_sequence(client, chat_id, message_id, branch, force=False, event=None):
+    """
+    Выполняет последовательность скачивания обновления, установки зависимостей и перезапуска.
+    """
+    async def update_status(msg_text):
+        if event:
+            try:
+                await event.edit(msg_text, buttons=None)
+                return
+            except Exception:
+                pass
+        await edit_any_message(client, chat_id, message_id, msg_text, buttons=None)
+
+    await update_status("⏳ **Проверяю и скачиваю обновление из GitHub...**")
+
+    # 1. Fetch
+    code, _, fetch_err = await run_git_cmd("fetch", "origin", branch)
+    if code != 0:
+        return await update_status(f"❌ Ошибка подключения к GitHub (`git fetch`):\n`{fetch_err}`")
+
+    # 2. Pull или Reset (в зависимости от режима force)
+    if force:
+        code, _, err = await run_git_cmd("reset", "--hard", f"origin/{branch}")
+        if code != 0:
+            return await update_status(f"❌ Ошибка `git reset`:\n`{err}`")
+        await run_git_cmd("clean", "-fd", "-e", "core_conf.json", "-e", "Global_config.json", "-e", "*.session", "-e", "*.session-journal")
+    else:
+        code, pull_out, pull_err = await run_git_cmd("pull", "origin", branch)
+        if code != 0:
+            conflict_hint = ""
+            if "conflict" in (pull_err + pull_out).lower() or "local changes" in (pull_err + pull_out).lower():
+                conflict_hint = (
+                    "\n\n💡 **Обнаружен конфликт с локальными файлами!**\n"
+                    "Используйте `.update force`, чтобы перезаписать локальные изменения версией из GitHub."
+                )
+            return await update_status(f"❌ **Ошибка при выполнении git pull:**\n`{pull_err or pull_out}`{conflict_hint}")
+
+    # 3. Обновление зависимостей
+    await update_status("📦 `Обновляю зависимости из requirements.txt...`")
+    pip_ok, pip_msg = await run_pip_requirements()
+    if not pip_ok:
+        await update_status(f"⚠️ Предупреждение pip при установке библиотек:\n`{pip_msg[:300]}`\n\nПродолжаю перезапуск...")
+        await asyncio.sleep(2)
+
+    # 4. Получаем данные о новом коммите
+    new_commit = await get_commit_info("HEAD")
+    commit_badge = f"`[{new_commit['short_hash']}]` {new_commit['message']}" if new_commit else "Актуальная версия"
+
+    restart_text = (
+        f"🎉 **Юзербот успешно обновлен{' (force)' if force else ''} и перезапущен!**\n\n"
+        f"🌿 **Ветка:** `{branch}`\n"
+        f"📌 **Коммит:** {commit_badge}\n"
+        f"👤 **Автор:** `{new_commit['author'] if new_commit else 'GitHub'}`"
+    )
+
+    await update_status("🔄 Перезапускаю юзербота для применения всех изменений...")
+    save_restart_info(chat_id, message_id, restart_text)
+
+    # 5. Корректное закрытие сессий и перезапуск
+    if client:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+    bot = get_bot()
+    if bot:
+        try:
+            await bot.disconnect()
+        except Exception:
+            pass
+
+    python = sys.executable
+    script = os.path.abspath(sys.argv[0])
+    os.execv(python, [python, script] + sys.argv[1:])
+
+
+# ==========================================
+# ОБРАБОТЧИКИ НАЖАТИЙ НА ИНЛАЙН-КНОПКИ
+# ==========================================
+
+def is_authorized_user(sender_id):
+    """Проверяет, является ли пользователь владельцем бота."""
+    owner_id = get_owner_id()
+    if not owner_id:
+        return True
+    return sender_id == owner_id
+
+
+@register_callback("upd_apply")
+async def cb_upd_apply(event, data):
+    """Кнопка 'Обновить' в инлайн-сообщении чата."""
+    sender = await event.get_sender()
+    if not is_authorized_user(sender.id):
+        return await event.answer("⚠️ Действие доступно только владельцу!", alert=True)
+
+    await event.answer("🚀 Запуск обновления...")
+    msg_id = getattr(event, "message_id", None) or getattr(event, "id", 0)
+    branch = await get_current_branch()
+    await run_update_sequence(None, event.chat_id, msg_id, branch, force=False, event=event)
+
+
+@register_callback("upd_cancel")
+async def cb_upd_cancel(event, data):
+    """Кнопка 'Отмена' в инлайн-сообщении."""
+    sender = await event.get_sender()
+    if not is_authorized_user(sender.id):
+        return await event.answer("⚠️ Действие доступно только владельцу!", alert=True)
+
+    await event.answer("Отменено")
+    text = (
+        "❌ **Проверка обновлений завершена.**\n\n"
+        "💡 Для новой проверки используйте команду `.update` или нажмите кнопку ниже."
+    )
+    buttons = [[Button.inline("🔄 Попробовать снова", b"upd_recheck")]]
+    try:
+        await event.edit(text, buttons=buttons)
+    except errors.MessageNotModifiedError:
+        pass
+
+
+@register_callback("upd_recheck")
+async def cb_upd_recheck(event, data):
+    """Кнопка 'Попробовать снова' в инлайн-сообщении."""
+    sender = await event.get_sender()
+    if not is_authorized_user(sender.id):
+        return await event.answer("⚠️ Действие доступно только владельцу!", alert=True)
+
+    await event.answer("🔄 Проверяю обновления...")
+    try:
+        await event.edit("🔄 `Проверяю наличие обновлений на GitHub...`", buttons=None)
+    except errors.MessageNotModifiedError:
+        pass
+
+    state = await check_updates_state()
+    if not state.get("ok"):
+        err_msg = f"❌ **Ошибка проверки обновлений:**\n`{state.get('error')}`"
+        buttons = [[Button.inline("🔄 Попробовать снова", b"upd_recheck")]]
+        try:
+            await event.edit(err_msg, buttons=buttons)
+        except errors.MessageNotModifiedError:
+            pass
+        return
+
+    text, buttons = build_update_ui(state)
+    try:
+        await event.edit(text, buttons=buttons)
+    except errors.MessageNotModifiedError:
+        await event.answer("✅ Информация актуальна!")
+
+
+@register_callback("bot_upd_apply")
+async def cb_bot_upd_apply(event, data):
+    """Кнопка 'Обновить' в сообщении от Telegram-бота."""
+    sender = await event.get_sender()
+    if not is_authorized_user(sender.id):
+        return await event.answer("⚠️ Действие доступно только владельцу!", alert=True)
+
+    await event.answer("🚀 Запуск обновления...")
+    msg_id = getattr(event, "message_id", None) or getattr(event, "id", 0)
+    branch = await get_current_branch()
+    await run_update_sequence(None, event.chat_id, msg_id, branch, force=False, event=event)
+
+
+@register_callback("bot_upd_snooze")
+async def cb_bot_upd_snooze(event, data):
+    """Кнопка 'Отложить' в сообщении от Telegram-бота."""
+    sender = await event.get_sender()
+    if not is_authorized_user(sender.id):
+        return await event.answer("⚠️ Действие доступно только владельцу!", alert=True)
+
+    await event.answer("⏳ Отложено")
+    hint_text = (
+        "⏳ **Обновление отложено.**\n\n"
+        "💡 **Подсказка:** Чтобы обновиться в любое время, "
+        "используйте команду `.update` в любом чате или нажмите кнопку ниже."
+    )
+    buttons = [[Button.inline("🚀 Обновить сейчас", b"bot_upd_apply")]]
+    try:
+        await event.edit(hint_text, buttons=buttons)
+    except errors.MessageNotModifiedError:
+        pass
+
+
+# ==========================================
+# ФОНОВАЯ ЗАДАЧА: АВТО-ПРОВЕРКА РАЗ В 15 МИНУТ
+# ==========================================
+
+@register_bg()
+async def auto_update_checker(client):
+    """
+    Фоновый процесс: каждые 15 минут проверяет наличие обновлений в репозитории.
+    При обнаружении отправляет сообщение владельцу от имени встроенного бота с кнопками.
+    """
+    # Ждем 60 секунд после запуска, чтобы ядро успело полностью инициализироваться
+    await asyncio.sleep(60)
+    last_notified_hash = None
+
+    while True:
+        try:
+            ready, _ = await ensure_git_setup()
+            if ready:
+                branch = await get_current_branch()
+                code, _, _ = await run_git_cmd("fetch", "origin", branch, timeout=30)
+                if code == 0:
+                    code_remote, remote_hash, _ = await run_git_cmd("rev-parse", f"origin/{branch}")
+                    code_local, local_hash, _ = await run_git_cmd("rev-parse", "HEAD")
+
+                    code_cnt, behind_str, _ = await run_git_cmd("rev-list", "--count", f"HEAD..origin/{branch}")
+                    behind_count = int(behind_str) if (code_cnt == 0 and behind_str.isdigit()) else 0
+
+                    if behind_count > 0 and remote_hash and remote_hash != last_notified_hash and remote_hash != local_hash:
+                        code_log, new_commits_log, _ = await run_git_cmd(
+                            "log",
+                            f"HEAD..origin/{branch}",
+                            "--pretty=format:• `[%h]` **%s** *(%an)*",
+                            "-n",
+                            "5"
+                        )
+                        commits_display = new_commits_log if (code_log == 0 and new_commits_log) else "• Новые изменения в репозитории"
+                        if behind_count > 5:
+                            commits_display += f"\n*...и еще {behind_count - 5} коммитов*"
+
+                        msg = (
+                            f"🔔 **Доступно обновление UBTG!**\n\n"
+                            f"🌿 **Ветка:** `{branch}`\n"
+                            f"🔢 **Новых коммитов:** `{behind_count}`\n\n"
+                            f"📋 **Список изменений:**\n"
+                            f"{commits_display}\n\n"
+                            f"💡 **Выберите действие:**"
+                        )
+
+                        buttons = [
+                            [
+                                Button.inline("🚀 Обновить", b"bot_upd_apply"),
+                                Button.inline("⏳ Отложить", b"bot_upd_snooze")
+                            ]
+                        ]
+
+                        bot = get_bot()
+                        owner_id = get_owner_id()
+                        if bot and owner_id:
+                            try:
+                                await bot.send_message(owner_id, msg, buttons=buttons)
+                                last_notified_hash = remote_hash
+                            except Exception as ex:
+                                print(f"[AutoUpdate] ⚠️ Ошибка отправки уведомления: {ex}")
+        except Exception as e:
+            print(f"[AutoUpdate] ⚠️ Ошибка в фоновом чеке обновлений: {e}")
+
+        # Проверка каждые 15 минут
+        await asyncio.sleep(15 * 60)
+
+
+# ==========================================
+# ОСНОВНАЯ КОМАНДА .UPDATE
+# ==========================================
+
 @register_cmd("update", desc="Проверить или установить обновления юзербота (.update / .update now / .update force)")
 async def update_cmd(client, event, args):
     """
     Команда управления обновлениями юзербота из GitHub.
     Использование:
-      .update — проверить наличие обновлений
-      .update now — скачать обновления и перезапустить бота
+      .update — проверить наличие обновлений (интерактивный инлайн режим)
+      .update now — мгновенно скачать обновления и перезапустить бота
       .update force — принудительно обновить с перезаписью локальных изменений
       .update log [N] — история последних N коммитов
       .update help — справка
@@ -159,11 +562,12 @@ async def update_cmd(client, event, args):
         help_text = (
             "🔄 **Модуль обновления UBTG**\n\n"
             "**Команды:**\n"
-            "• `.update` или `.update check` — проверить наличие новых коммитов\n"
-            "• `.update now` (или `.update pull`) — скачать обновление, докачать библиотеки и перезапустить бота\n"
+            "• `.update` — интерактивная проверка обновлений с инлайн-кнопками\n"
+            "• `.update now` (или `.update pull`) — мгновенно скачать обновление и перезапустить бота\n"
             "• `.update force` (или `.update -f`) — принудительно обновить (сбросить локальные конфликты)\n"
             "• `.update log [число]` — показать историю последних коммитов (по умолчанию 10)\n"
             "• `.version` — текущая версия и информация о коммите\n\n"
+            "⏰ **Авто-проверка:** Каждые 15 минут в фоне бот проверяет обновления и присылает уведомление в ЛС.\n\n"
             f"🔗 **Официальный репозиторий:**\n{OFFICIAL_REPO_URL}"
         )
         return await event.edit(help_text)
@@ -196,179 +600,37 @@ async def update_cmd(client, event, args):
 
     # --- РЕЖИМ 2: ПРИНУДИТЕЛЬНОЕ ОБНОВЛЕНИЕ (.update force / -f) ---
     if subcmd in ("force", "-f", "hard"):
-        await event.edit("⚠️ **Запуск принудительного обновления...**\n`Сбрасываю локальные изменения и стягиваю свежий код...`")
-
-        # 1. Fetch
-        code, _, err = await run_git_cmd("fetch", "origin", branch)
-        if code != 0:
-            return await event.edit(f"❌ Ошибка `git fetch`:\n`{err}`")
-
-        # 2. Reset hard
-        code, reset_out, err = await run_git_cmd("reset", "--hard", f"origin/{branch}")
-        if code != 0:
-            return await event.edit(f"❌ Ошибка `git reset`:\n`{err}`")
-
-        # 3. Clean untracked pycache / artifacts (без удаления конфигов и сессий)
-        await run_git_cmd("clean", "-fd", "-e", "core_conf.json", "-e", "Global_config.json", "-e", "*.session", "-e", "*.session-journal")
-
-        # 4. Обновление зависимостей
-        await event.edit("📦 `Проверяю и обновляю зависимости (pip requirements)...`")
-        pip_ok, pip_msg = await run_pip_requirements()
-        if not pip_ok:
-            await event.edit(f"⚠️ Зависимости установились с предупреждением:\n`{pip_msg[:300]}`\n\nПерезапускаю...")
-            await asyncio.sleep(2)
-
-        # 5. Получаем инфу о новом коммите
-        new_commit = await get_commit_info("HEAD")
-        commit_badge = f"`[{new_commit['short_hash']}]` {new_commit['message']}" if new_commit else "Актуальная версия"
-
-        restart_text = (
-            f"🎉 **Юзербот успешно обновлен (force) и перезапущен!**\n\n"
-            f"🌿 **Ветка:** `{branch}`\n"
-            f"📌 **Коммит:** {commit_badge}\n"
-            f"👤 **Автор:** `{new_commit['author'] if new_commit else 'GitHub'}`"
-        )
-
-        await event.edit("🔄 Перезапускаю юзербота для применения изменений...")
-        save_restart_info(event.chat_id, event.id, restart_text)
-
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
-
-        python = sys.executable
-        script = os.path.abspath(sys.argv[0])
-        os.execv(python, [python, script] + sys.argv[1:])
+        await run_update_sequence(client, event.chat_id, event.id, branch, force=True, event=event)
         return
 
-    # --- РЕЖИМ 3: СТАНДАРТНОЕ ОБНОВЛЕНИЕ (.update now / pull / apply) ---
+    # --- РЕЖИМ 3: ПРЯМОЕ ОБНОВЛЕНИЕ БЕЗ КНОПОК (.update now / pull / apply) ---
     if subcmd in ("now", "pull", "apply", "upgrade"):
-        await event.edit("⏳ **Проверяю и скачиваю обновление из GitHub...**")
-
-        # 1. Fetch
-        code, _, fetch_err = await run_git_cmd("fetch", "origin", branch)
-        if code != 0:
-            return await event.edit(f"❌ Ошибка подключения к GitHub (`git fetch`):\n`{fetch_err}`")
-
-        # 2. Выполняем pull
-        code, pull_out, pull_err = await run_git_cmd("pull", "origin", branch)
-        if code != 0:
-            conflict_hint = ""
-            if "conflict" in (pull_err + pull_out).lower() or "local changes" in (pull_err + pull_out).lower():
-                conflict_hint = (
-                    "\n\n💡 **Обнаружен конфликт с локальными файлами!**\n"
-                    "Используйте `.update force`, чтобы перезаписать локальные изменения версией из GitHub."
-                )
-            return await event.edit(f"❌ **Ошибка при выполнении git pull:**\n`{pull_err or pull_out}`{conflict_hint}")
-
-        # 3. Проверяем, были ли вообще изменения
-        if "Already up to date" in pull_out or "Уже обновлено" in pull_out:
-            cur = await get_commit_info("HEAD")
-            cur_info = f"`[{cur['short_hash']}]` {cur['message']}" if cur else ""
-            return await event.edit(f"✅ **Юзербот уже обновлен до последней версии!**\n🌿 Ветка: `{branch}`\n📌 {cur_info}")
-
-        # 4. Установка новых зависимостей при необходимости
-        await event.edit("📦 `Обновляю зависимости из requirements.txt...`")
-        pip_ok, pip_msg = await run_pip_requirements()
-        if not pip_ok:
-            await event.edit(f"⚠️ Предупреждение pip при установке библиотек:\n`{pip_msg[:300]}`\n\nПродолжаю перезапуск...")
-            await asyncio.sleep(2)
-
-        # 5. Получаем новый коммит
-        new_commit = await get_commit_info("HEAD")
-        commit_badge = f"`[{new_commit['short_hash']}]` {new_commit['message']}" if new_commit else "Актуальная версия"
-
-        restart_text = (
-            f"🎉 **Юзербот успешно обновлен и перезапущен!**\n\n"
-            f"🌿 **Ветка:** `{branch}`\n"
-            f"📌 **Коммит:** {commit_badge}\n"
-            f"👤 **Автор:** `{new_commit['author'] if new_commit else 'GitHub'}`"
-        )
-
-        await event.edit("🔄 Перезапускаю юзербота для применения всех изменений...")
-        save_restart_info(event.chat_id, event.id, restart_text)
-
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
-
-        python = sys.executable
-        script = os.path.abspath(sys.argv[0])
-        os.execv(python, [python, script] + sys.argv[1:])
+        await run_update_sequence(client, event.chat_id, event.id, branch, force=False, event=event)
         return
 
-    # --- РЕЖИМ 4: ПРОВЕРКА НАЛИЧИЯ ОБНОВЛЕНИЙ (.update / .update check) ---
+    # --- РЕЖИМ 4: ИНТЕРАКТИВНАЯ ПРОВЕРКА ОБНОВЛЕНИЙ (.update / .update check) ---
     await event.edit("🔄 `Проверяю наличие обновлений на GitHub...`")
 
-    # Fetch
-    code, _, fetch_err = await run_git_cmd("fetch", "origin", branch)
-    if code != 0:
-        return await event.edit(f"❌ **Не удалось связаться с GitHub:**\n`{fetch_err}`")
+    state = await check_updates_state()
+    if not state.get("ok"):
+        return await event.edit(f"❌ **Ошибка проверки обновлений:**\n`{state.get('error')}`")
 
-    # Считаем коммиты между локальным HEAD и origin/branch
-    code, behind_count_str, _ = await run_git_cmd("rev-list", "--count", f"HEAD..origin/{branch}")
-    behind_count = int(behind_count_str) if (code == 0 and behind_count_str.isdigit()) else 0
+    text, buttons = build_update_ui(state)
 
-    code, ahead_count_str, _ = await run_git_cmd("rev-list", "--count", f"origin/{branch}..HEAD")
-    ahead_count = int(ahead_count_str) if (code == 0 and ahead_count_str.isdigit()) else 0
-
-    current_commit = await get_commit_info("HEAD")
-    cur_hash_str = f"`{current_commit['short_hash']}`" if current_commit else "Н/Д"
-    cur_msg_str = current_commit['message'] if current_commit else ""
-    cur_author_str = current_commit['author'] if current_commit else "Неизвестен"
-    cur_date_str = current_commit['date'] if current_commit else ""
-
-    if behind_count > 0:
-        # Есть доступные обновления
-        code, new_commits_log, _ = await run_git_cmd(
-            "log",
-            f"HEAD..origin/{branch}",
-            "--pretty=format:• `[%h]` **%s** *(%an)*",
-            "-n",
-            "10"
+    # Отправляем через инлайн с кнопками
+    try:
+        await send_inline(
+            client,
+            event.chat_id,
+            text,
+            buttons=buttons,
+            reply_to=event.message.reply_to_msg_id
         )
-
-        commits_display = new_commits_log if (code == 0 and new_commits_log) else "• Новые изменения в репозитории"
-        if behind_count > 10:
-            commits_display += f"\n*...и еще {behind_count - 10} коммитов*"
-
-        msg = (
-            f"📦 **Доступно обновление UBTG!**\n\n"
-            f"🌿 **Ветка:** `{branch}`\n"
-            f"🔢 **Новых коммитов:** `{behind_count}`\n\n"
-            f"📋 **Список изменений:**\n"
-            f"{commits_display}\n\n"
-            f"💡 **Чтобы установить обновление, выполните:**\n"
-            f"`.update now` — скачать и перезапустить бота\n"
-            f"`.update force` — принудительно (если есть локальные конфликты)"
-        )
-        await event.edit(msg)
-
-    elif ahead_count > 0:
-        # Локальная ветка опережает удаленную
-        msg = (
-            f"ℹ️ **Локальная версия опережает репозиторий**\n\n"
-            f"🌿 **Ветка:** `{branch}`\n"
-            f"🔢 **Локальных коммитов:** `{ahead_count}`\n"
-            f"📌 **Текущий коммит:** {cur_hash_str} — {cur_msg_str}\n"
-            f"👤 **Автор:** `{cur_author_str}` ({cur_date_str})\n\n"
-            f"💡 Для синхронизации с GitHub можно использовать `.update force`."
-        )
-        await event.edit(msg)
-
-    else:
-        # Полностью актуальная версия
-        msg = (
-            f"✅ **Юзербот обновлен до последней версии!**\n\n"
-            f"🌿 **Ветка:** `{branch}`\n"
-            f"📌 **Текущий коммит:** {cur_hash_str}\n"
-            f"💬 `{cur_msg_str}`\n"
-            f"👤 **Автор:** `{cur_author_str}` ({cur_date_str})\n\n"
-            f"🔗 [GitHub Репозиторий]({OFFICIAL_REPO_URL})"
-        )
-        await event.edit(msg)
+        await event.delete()
+    except Exception as inline_ex:
+        # Резервный вариант, если бот или инлайн недоступен
+        print(f"[Update] send_inline fallback: {inline_ex}")
+        await event.edit(text)
 
 
 @register_cmd("version", desc="Показывает текущую версию, коммит и ветку юзербота")
@@ -400,3 +662,4 @@ async def version_cmd(client, event, args):
 async def check_update_alias(client, event, args):
     """Алиас для быстрой проверки обновлений."""
     await update_cmd(client, event, "check")
+

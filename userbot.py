@@ -323,8 +323,25 @@ async def notify_after_restart():
             text = f"{custom_text}\n⏱ Заняло: `{elapsed:.2f} сек.`"
         else:
             text = f"✅ **Успешно перезагружен!**\n⏱ Заняло: `{elapsed:.2f} сек.`"
-        await client.edit_message(restart_info["chat_id"], restart_info["message_id"], text)
-        await send_bot_notification(text)
+        
+        edited = False
+        try:
+            await client.edit_message(restart_info["chat_id"], restart_info["message_id"], text)
+            edited = True
+        except Exception:
+            pass
+
+        if not edited:
+            bot = get_bot()
+            if bot:
+                try:
+                    await bot.edit_message(restart_info["chat_id"], restart_info["message_id"], text)
+                    edited = True
+                except Exception:
+                    pass
+
+        if not edited:
+            await send_bot_notification(text)
     except Exception as e: pass
 
 async def handle_incoming_messages(event):

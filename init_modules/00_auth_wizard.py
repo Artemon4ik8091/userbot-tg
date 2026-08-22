@@ -14,6 +14,11 @@ from telethon import errors
 # --- КОНСТАНТЫ И АРГУМЕНТЫ CLI ---
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_FILE = os.path.join(BASE_DIR, "core_conf.json")
+AUTH_LINK_FILE = os.path.join(BASE_DIR, "auth_link.txt")
+AUTH_URL_FILE = os.path.join(BASE_DIR, "auth_url.txt")
+WEB_URL_FILE = os.path.join(BASE_DIR, "web_url.txt")
+SETUP_URL_FILE = os.path.join(BASE_DIR, "setup_url.txt")
+ALL_LINK_FILES = (AUTH_LINK_FILE, AUTH_URL_FILE, WEB_URL_FILE, SETUP_URL_FILE)
 WEB_SETUP_HOST = "127.0.0.1"
 WEB_SETUP_TIMEOUT = 600
 
@@ -759,6 +764,42 @@ def start_web_config_server():
     return server, thread
 
 
+def dump_web_links(server, tunnel_url=None, path=""):
+    """Сохраняет актуальные ссылки на веб-интерфейс в текстовые файлы."""
+    if not server:
+        return
+    
+    port = server.server_address[1]
+    local_url = f"http://{WEB_SETUP_HOST}:{port}{path}"
+    
+    lines = []
+    if tunnel_url:
+        public_url = f"{tunnel_url.rstrip('/')}{path}"
+        lines.append(public_url)
+        lines.append(local_url)
+    else:
+        lines.append(local_url)
+    
+    content = "\n".join(lines) + "\n"
+    
+    for file_path in (AUTH_LINK_FILE, AUTH_URL_FILE, WEB_URL_FILE, SETUP_URL_FILE):
+        try:
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(content)
+        except Exception as e:
+            print(f"[Init:Auth] ⚠️ Не удалось сохранить ссылку в {file_path}: {e}")
+
+
+def remove_auth_link():
+    """Удаляет временные файлы со ссылками авторизации после завершения входа."""
+    for file_path in ALL_LINK_FILES:
+        if os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except Exception:
+                pass
+
+
 def ensure_web_setup_server():
     """Гарантирует, что веб-сервер для QR-страницы запущен и возвращает его."""
     global WEB_SETUP_SERVER
@@ -766,6 +807,7 @@ def ensure_web_setup_server():
         return WEB_SETUP_SERVER
 
     server, _ = start_web_config_server()
+    dump_web_links(server, path="/qr")
     print(f"🌐 Откройте страницу QR: http://{WEB_SETUP_HOST}:{server.server_address[1]}/qr")
     return server
 
@@ -843,6 +885,7 @@ def shutdown_web_setup_server():
     except Exception:
         pass
     WEB_SETUP_SERVER = None
+    remove_auth_link()
 
 
 def start_localtunnel(port, timeout=20):
@@ -906,10 +949,13 @@ def stop_localtunnel(process):
 def wait_for_web_config():
     """Ожидает, пока пользователь сохранит настройки через веб-форму."""
     server, _ = start_web_config_server()
+    dump_web_links(server, path="/")
     tunnel_process = None
     tunnel_url = None
     try:
         tunnel_process, tunnel_url = start_localtunnel(server.server_address[1])
+        if tunnel_url:
+            dump_web_links(server, tunnel_url=tunnel_url, path="/")
     except Exception as e:
         print(f"[Core] ⚠️ Не удалось запустить localtunnel: {e}")
 
@@ -922,6 +968,7 @@ def wait_for_web_config():
         print(f"🌍 Публичный временный домен: {tunnel_url}")
     else:
         print("ℹ️ localtunnel недоступен или не успел подняться; используется только локальный адрес.")
+    print(f"📁 Ссылка для веб-настройки сохранена в файл: {AUTH_LINK_FILE}")
     print("Ожидаю сохранения настроек...")
     print("\n💡 Для перехода к QR-коду откройте: http://127.0.0.1:" + str(server.server_address[1]) + "/qr")
 
@@ -940,22 +987,27 @@ def wait_for_web_config():
 def setup_qr_web_ui():
     """Создает и настраивает веб-интерфейс для QR кода."""
     server = ensure_web_setup_server()
+    dump_web_links(server, path="/qr")
     tunnel_process = None
+    tunnel_url = None
     try:
         tunnel_process, tunnel_url = start_localtunnel(server.server_address[1])
         if tunnel_url:
+            dump_web_links(server, tunnel_url=tunnel_url, path="/qr")
             print(f"🌍 Публичная ссылка для QR: {tunnel_url}/qr")
     except Exception:
         pass
     print_web_setup_links(server)
+    print(f"📁 Ссылка на веб-интерфейс сохранена в файл: {AUTH_LINK_FILE}")
     return server, tunnel_process
 
 
 def close_qr_ui(server, tunnel_process):
-    """Останавливает UI и туннель для QR."""
+    """Останавливает UI и туннель для QR и удаляет временные файлы со ссылкой."""
     shutdown_web_setup_server()
     if tunnel_process:
         stop_localtunnel(tunnel_process)
+    remove_auth_link()
 
 
 # ==========================================
@@ -1004,6 +1056,7 @@ async def pre_auth(client):
     server, tunnel_process = setup_qr_web_ui()
     
     update_qr_ui(qr_login.url, "Сканируйте QR-код в приложении Telegram для входа в аккаунт.")
+    print(f"🔗 Telegram-ссылка для авторизации: {qr_login.url}")
     
     try:
         while True:
@@ -1044,6 +1097,7 @@ async def pre_auth(client):
                 print("[Init:Auth] Время жизни QR-кода истекло, генерируем новый (авто-обновление)...")
                 await qr_login.recreate()
                 update_qr_ui(qr_login.url, "Время действия предыдущего QR-кода истекло. Отсканируйте новый.")
+                print(f"🔗 Новая Telegram-ссылка для авторизации: {qr_login.url}")
     except errors.SessionPasswordNeededError:
         error_msg = None
         while True:

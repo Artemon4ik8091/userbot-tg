@@ -8,4 +8,8 @@ bot_config.json
 restart_info.json
 bot_session.session
 bot_session.session-journal
+auth_link.txt
+auth_url.txt
+web_url.txt
+setup_url.txt
 __pycache__/

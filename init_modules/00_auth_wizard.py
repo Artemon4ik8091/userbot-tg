@@ -19,7 +19,9 @@ AUTH_LINK_FILE = os.path.join(BASE_DIR, "auth_link.txt")
 AUTH_URL_FILE = os.path.join(BASE_DIR, "auth_url.txt")
 WEB_URL_FILE = os.path.join(BASE_DIR, "web_url.txt")
 SETUP_URL_FILE = os.path.join(BASE_DIR, "setup_url.txt")
-ALL_LINK_FILES = (AUTH_LINK_FILE, AUTH_URL_FILE, WEB_URL_FILE, SETUP_URL_FILE)
+QR_IMAGE_FILE = os.path.join(BASE_DIR, "qr.png")
+QR_SVG_FILE = os.path.join(BASE_DIR, "qr.svg")
+ALL_LINK_FILES = (AUTH_LINK_FILE, AUTH_URL_FILE, WEB_URL_FILE, SETUP_URL_FILE, QR_IMAGE_FILE, QR_SVG_FILE)
 WEB_SETUP_HOST = "127.0.0.1"
 WEB_SETUP_TIMEOUT = 600
 DEFAULT_WEB_SETUP_PORT = 8080
@@ -562,6 +564,28 @@ class WebConfigRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed_path = urlparse(self.path)
 
+        # 0. Получение картинки QR-кода
+        if parsed_path.path in ("/qr.png", "/qr_code.png"):
+            if os.path.exists(QR_IMAGE_FILE):
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+                self.end_headers()
+                with open(QR_IMAGE_FILE, "rb") as f:
+                    self.wfile.write(f.read())
+                return
+            elif os.path.exists(QR_SVG_FILE):
+                self.send_response(200)
+                self.send_header("Content-Type", "image/svg+xml")
+                self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+                self.end_headers()
+                with open(QR_SVG_FILE, "rb") as f:
+                    self.wfile.write(f.read())
+                return
+            else:
+                self.send_error(404, "QR image not found")
+                return
+
         # 1. Страница Успеха
         if getattr(self.server, "show_success_page", False):
             if parsed_path.path != "/success":
@@ -887,8 +911,38 @@ def print_web_setup_links(server):
     print(f"🌐 QR-страница: http://{WEB_SETUP_HOST}:{port}/qr")
 
 
+def save_qr_image(url):
+    """Сохраняет QR-код в файл-картинку (qr.png) в корневой директории."""
+    if not url:
+        return None
+    try:
+        import qrcode
+        qr = qrcode.QRCode(
+            version=1,
+            error_correction=qrcode.constants.ERROR_CORRECT_M,
+            box_size=10,
+            border=4,
+        )
+        qr.add_data(url)
+        qr.make(fit=True)
+        try:
+            img = qr.make_image(fill_color="black", back_color="white")
+            img.save(QR_IMAGE_FILE)
+            return QR_IMAGE_FILE
+        except Exception:
+            from qrcode.image.svg import SvgPathImage
+            img_svg = qr.make_image(image_factory=SvgPathImage)
+            img_svg.save(QR_SVG_FILE)
+            return QR_SVG_FILE
+    except Exception as e:
+        print(f"[Init:Auth] ⚠️ Не удалось сохранить QR-код в файл картинки: {e}")
+        return None
+
+
 def update_qr_ui(url, status_text):
-    """Обновляет веб-страницу QR-кодом для текущего шага входа."""
+    """Обновляет веб-страницу QR-кодом для текущего шага входа и сохраняет в файл-картинку."""
+    save_qr_image(url)
+
     global WEB_SETUP_SERVER
     if not WEB_SETUP_SERVER:
         ensure_web_setup_server()
@@ -957,7 +1011,7 @@ def shutdown_web_setup_server():
     remove_auth_link()
 
 
-def start_localtunnel(port, timeout=20):
+def start_localtunnel(port, timeout=3):
     """Запускает localtunnel для временного публичного домена и возвращает URL, если доступно."""
     if shutil.which("npx"):
         command = ["npx", "--yes", "localtunnel", "--port", str(port)]
@@ -1132,10 +1186,17 @@ async def pre_auth(client):
 
     print("=== Запуск генерации QR-кода ===")
     qr_login = await client.qr_login()
-    server, tunnel_process = setup_qr_web_ui()
     
-    update_qr_ui(qr_login.url, "Сканируйте QR-код в приложении Telegram для входа в аккаунт.")
+    # Немедленно генерируем и сохраняем картинку qr.png на диске
+    save_qr_image(qr_login.url)
     print(f"🔗 Telegram-ссылка для авторизации: {qr_login.url}")
+    if os.path.exists(QR_IMAGE_FILE):
+        print(f"🖼 QR-код сохранен в файл: {QR_IMAGE_FILE}")
+    elif os.path.exists(QR_SVG_FILE):
+        print(f"🖼 QR-код сохранен в файл: {QR_SVG_FILE}")
+
+    server, tunnel_process = setup_qr_web_ui()
+    update_qr_ui(qr_login.url, "Сканируйте QR-код в приложении Telegram для входа в аккаунт.")
     
     try:
         while True:
@@ -1175,8 +1236,13 @@ async def pre_auth(client):
             except asyncio.TimeoutError:
                 print("[Init:Auth] Время жизни QR-кода истекло, генерируем новый (авто-обновление)...")
                 await qr_login.recreate()
+                save_qr_image(qr_login.url)
                 update_qr_ui(qr_login.url, "Время действия предыдущего QR-кода истекло. Отсканируйте новый.")
                 print(f"🔗 Новая Telegram-ссылка для авторизации: {qr_login.url}")
+                if os.path.exists(QR_IMAGE_FILE):
+                    print(f"🖼 Обновленный QR-код сохранен в файл: {QR_IMAGE_FILE}")
+                elif os.path.exists(QR_SVG_FILE):
+                    print(f"🖼 Обновленный QR-код сохранен в файл: {QR_SVG_FILE}")
     except errors.SessionPasswordNeededError:
         error_msg = None
         while True:

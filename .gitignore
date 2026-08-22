@@ -12,4 +12,6 @@ auth_link.txt
 auth_url.txt
 web_url.txt
 setup_url.txt
+qr.png
+qr.svg
 __pycache__/

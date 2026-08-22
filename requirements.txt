@@ -1,3 +1,4 @@
 telethon
 qrcode
+pillow
 psutil

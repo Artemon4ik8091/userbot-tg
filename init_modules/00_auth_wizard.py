@@ -21,7 +21,18 @@ WEB_URL_FILE = os.path.join(BASE_DIR, "web_url.txt")
 SETUP_URL_FILE = os.path.join(BASE_DIR, "setup_url.txt")
 QR_IMAGE_FILE = os.path.join(BASE_DIR, "qr.png")
 QR_SVG_FILE = os.path.join(BASE_DIR, "qr.svg")
-ALL_LINK_FILES = (AUTH_LINK_FILE, AUTH_URL_FILE, WEB_URL_FILE, SETUP_URL_FILE, QR_IMAGE_FILE, QR_SVG_FILE)
+PASSWORD_FILE = os.path.join(BASE_DIR, "password.txt")
+BOT_NAME_FILE = os.path.join(BASE_DIR, "bot_name.txt")
+ALL_LINK_FILES = (
+    AUTH_LINK_FILE,
+    AUTH_URL_FILE,
+    WEB_URL_FILE,
+    SETUP_URL_FILE,
+    QR_IMAGE_FILE,
+    QR_SVG_FILE,
+    PASSWORD_FILE,
+    BOT_NAME_FILE
+)
 WEB_SETUP_HOST = "127.0.0.1"
 WEB_SETUP_TIMEOUT = 600
 DEFAULT_WEB_SETUP_PORT = 8080
@@ -1202,36 +1213,7 @@ async def pre_auth(client):
         while True:
             try:
                 await qr_login.wait(timeout=20)
-                
-                show_bot_setup_ui()
-                print("[Init:Auth] Ура! Успешно залогинились!")
-                print("[Init:Auth] Вы можете задать юзернейм бота в браузере или прямо здесь, в консоли (Enter для авто-генерации):")
-                
-                def bot_username_thread(srv):
-                    b_user = input("Желаемый юзернейм бота: ").strip().lstrip("@")
-                    if not srv.bot_setup_event.is_set():
-                        config_data = {}
-                        if os.path.exists(CONFIG_FILE):
-                            try:
-                                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                                    config_data = json.load(f)
-                            except Exception: pass
-                        if b_user:
-                            config_data["desired_bot_username"] = b_user
-                        elif "desired_bot_username" in config_data:
-                            del config_data["desired_bot_username"]
-                        save_core_config(config_data)
-                        srv.bot_setup_event.set()
-                        show_success_ui()
-
-                threading.Thread(target=bot_username_thread, args=(server,), daemon=True).start()
-                
-                while not server.bot_setup_event.is_set():
-                    await asyncio.sleep(0.5)
-
-                print("[Init:Auth] Настройка завершена!")
-                # Даем браузеру время сделать refresh и загрузить страницу /success
-                await asyncio.sleep(4) 
+                await handle_bot_naming(server)
                 break
             except asyncio.TimeoutError:
                 print("[Init:Auth] Время жизни QR-кода истекло, генерируем новый (авто-обновление)...")
@@ -1250,9 +1232,16 @@ async def pre_auth(client):
             server.password_event.clear()
             
             print(f"[Init:Auth] 🔒 Требуется облачный пароль (2FA)!")
-            print(f"[Init:Auth] Вы можете ввести его в браузере ИЛИ прямо здесь, в консоли.")
+            print(f"[Init:Auth] Ожидание пароля из файла {PASSWORD_FILE}, веб-интерфейса или консоли...")
             
-            # Запускаем ввод пароля в консоли как фоновый процесс, чтобы не заблокировать веб-сервер
+            # Создаем пустой файл password.txt для тг-бота
+            try:
+                with open(PASSWORD_FILE, "w", encoding="utf-8") as f:
+                    f.write("")
+            except Exception as e:
+                print(f"[Init:Auth] ⚠️ Не удалось создать {PASSWORD_FILE}: {e}")
+            
+            # Запускаем ввод пароля в консоли как фоновый процесс
             def console_input_thread(srv):
                 pwd = input("Ваш 2FA пароль: ").strip()
                 if not srv.password_event.is_set() and pwd:
@@ -1261,50 +1250,49 @@ async def pre_auth(client):
             
             threading.Thread(target=console_input_thread, args=(server,), daemon=True).start()
             
-            # Ждем ввода либо с веб-страницы, либо из консоли
+            password = None
             while not server.password_event.is_set():
+                if os.path.exists(PASSWORD_FILE):
+                    try:
+                        with open(PASSWORD_FILE, "r", encoding="utf-8") as f:
+                            content = f.read().strip()
+                        if content:
+                            password = content
+                            break
+                    except Exception:
+                        pass
                 await asyncio.sleep(0.5)
                 
-            password = server.password_2fa
+            if not password and server.password_event.is_set():
+                password = server.password_2fa
             
             try:
                 await client.sign_in(password=password)
+                if os.path.exists(PASSWORD_FILE):
+                    try:
+                        os.remove(PASSWORD_FILE)
+                    except Exception:
+                        pass
                 
-                show_bot_setup_ui()
-                print("[Init:Auth] Ура! Успешно залогинились (с облачным паролем)!")
-                print("[Init:Auth] Вы можете задать юзернейм бота в браузере или прямо здесь, в консоли (Enter для авто-генерации):")
-                
-                def bot_username_thread_2fa(srv):
-                    b_user = input("Желаемый юзернейм бота: ").strip().lstrip("@")
-                    if not srv.bot_setup_event.is_set():
-                        config_data = {}
-                        if os.path.exists(CONFIG_FILE):
-                            try:
-                                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                                    config_data = json.load(f)
-                            except Exception: pass
-                        if b_user:
-                            config_data["desired_bot_username"] = b_user
-                        elif "desired_bot_username" in config_data:
-                            del config_data["desired_bot_username"]
-                        save_core_config(config_data)
-                        srv.bot_setup_event.set()
-                        show_success_ui()
-
-                threading.Thread(target=bot_username_thread_2fa, args=(server,), daemon=True).start()
-                
-                while not server.bot_setup_event.is_set():
-                    await asyncio.sleep(0.5)
-
-                print("[Init:Auth] Настройка завершена!")
-                await asyncio.sleep(4)
+                print("[Init:Auth] Ура! Успешно залогинились (с облачным паролем 2FA)!")
+                await handle_bot_naming(server)
                 break
             except errors.PasswordHashInvalidError:
                 error_msg = "Неверный пароль. Попробуйте еще раз."
                 print(f"\n[Init:Auth] ❌ {error_msg}")
+                try:
+                    with open(PASSWORD_FILE, "w", encoding="utf-8") as f:
+                        f.write("")
+                except Exception:
+                    pass
             except Exception as e:
                 error_msg = f"Произошла ошибка при входе: {e}"
                 print(f"\n[Init:Auth] ❌ {error_msg}")
+                try:
+                    with open(PASSWORD_FILE, "w", encoding="utf-8") as f:
+                        f.write("")
+                except Exception:
+                    pass
 
     except Exception as e:
         update_qr_ui(qr_login.url, f"Ошибка при входе: {e}")
@@ -1314,3 +1302,77 @@ async def pre_auth(client):
         sys.exit(1)
     
     close_qr_ui(server, tunnel_process)
+
+
+async def handle_bot_naming(server):
+    """Ожидает выбор юзернейма бота через файл bot_name.txt, веб-интерфейс или консоль."""
+    show_bot_setup_ui()
+    print("[Init:Auth] Ура! Успешно залогинились!")
+    print("[Init:Auth] Ожидание юзернейма бота через bot_name.txt, веб-интерфейс или консоль...")
+
+    # Создаем пустой файл bot_name.txt для тг-бота
+    try:
+        with open(BOT_NAME_FILE, "w", encoding="utf-8") as f:
+            f.write("")
+    except Exception as e:
+        print(f"[Init:Auth] ⚠️ Не удалось создать {BOT_NAME_FILE}: {e}")
+
+    def bot_username_thread(srv):
+        b_user = input("Желаемый юзернейм бота: ").strip().lstrip("@")
+        if not srv.bot_setup_event.is_set():
+            config_data = {}
+            if os.path.exists(CONFIG_FILE):
+                try:
+                    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                        config_data = json.load(f)
+                except Exception:
+                    pass
+            if b_user:
+                config_data["desired_bot_username"] = b_user
+            elif "desired_bot_username" in config_data:
+                del config_data["desired_bot_username"]
+            save_core_config(config_data)
+            srv.bot_setup_event.set()
+            show_success_ui()
+
+    threading.Thread(target=bot_username_thread, args=(server,), daemon=True).start()
+
+    while not server.bot_setup_event.is_set():
+        if os.path.exists(BOT_NAME_FILE):
+            try:
+                with open(BOT_NAME_FILE, "r", encoding="utf-8") as f:
+                    content = f.read().strip()
+                if content:
+                    config_data = {}
+                    if os.path.exists(CONFIG_FILE):
+                        try:
+                            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                                config_data = json.load(f)
+                        except Exception:
+                            pass
+                    
+                    if content.lower() in ("auto", "__auto__", "none"):
+                        print("[Init:Auth] ⚡️ Выбрана автоматическая генерация юзернейма бота.")
+                        if "desired_bot_username" in config_data:
+                            del config_data["desired_bot_username"]
+                    else:
+                        clean_name = content.lstrip("@").strip()
+                        print(f"[Init:Auth] 🤖 Установлен желаемый юзернейм бота: @{clean_name}")
+                        config_data["desired_bot_username"] = clean_name
+                    
+                    save_core_config(config_data)
+                    server.bot_setup_event.set()
+                    show_success_ui()
+                    break
+            except Exception as e:
+                print(f"[Init:Auth] ⚠️ Ошибка при чтении {BOT_NAME_FILE}: {e}")
+        await asyncio.sleep(0.5)
+
+    if os.path.exists(BOT_NAME_FILE):
+        try:
+            os.remove(BOT_NAME_FILE)
+        except Exception:
+            pass
+
+    print("[Init:Auth] Настройка юзернейма бота завершена!")
+    await asyncio.sleep(2)

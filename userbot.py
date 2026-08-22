@@ -517,4 +517,4 @@ if __name__ == '__main__':
             if client and client.is_connected(): client.loop.run_until_complete(client.disconnect())
         except: pass
 
-#тестовая обнова
+#вторая тестовая обнова

@@ -473,10 +473,10 @@ def is_system_module(module_id):
 # сообщение, куда нужно отправить подтверждение об успешном рестарте.
 RESTART_FILE = "restart_info.json"
 
-def save_restart_info(chat_id, message_id, custom_text=None):
+def save_restart_info(chat_id, message_id, custom_text=None, inline_message_id=None):
     """
     Сохраняет данные о том, где было вызвано .restart или .update, чтобы после
-    перезапуска процесса ядро могло отредактировать это же сообщение.
+    перезапуска процесса ядро могло отредактировать это же сообщение (включая inline-сообщения).
     """
     data = {
         "chat_id": chat_id,
@@ -485,6 +485,8 @@ def save_restart_info(chat_id, message_id, custom_text=None):
     }
     if custom_text:
         data["custom_text"] = custom_text
+    if inline_message_id:
+        data["inline_message_id"] = inline_message_id
     try:
         with open(RESTART_FILE, 'w', encoding='utf-8') as f:
             json.dump(data, f)
@@ -511,7 +513,7 @@ def pop_restart_info():
             pass
     return data
 
-async def restart_userbot(client=None, chat_id=None, message_id=None, custom_text=None):
+async def restart_userbot(client=None, chat_id=None, message_id=None, custom_text=None, event=None):
     """
     Выполняет полную перезагрузку юзербота (полный перезапуск Python-процесса).
     Сохраняет данные для восстановления контекста/редактирования исходного сообщения после перезапуска.
@@ -519,9 +521,24 @@ async def restart_userbot(client=None, chat_id=None, message_id=None, custom_tex
     restart_logger = get_logger("Restart")
     restart_logger.info("🔄 Инициализация перезагрузки юзербота...")
 
-    if chat_id is not None and message_id is not None:
-        restart_logger.debug(f"Сохранение контекста перезагрузки: chat_id={chat_id}, message_id={message_id}")
-        save_restart_info(chat_id, message_id, custom_text=custom_text)
+    inline_info = None
+    if event:
+        input_msg_id = getattr(event, "_input_inline_message_id", None)
+        if input_msg_id:
+            inline_info = {
+                "type": type(input_msg_id).__name__,
+                "dc_id": getattr(input_msg_id, "dc_id", 0),
+                "id": getattr(input_msg_id, "id", 0),
+                "access_hash": getattr(input_msg_id, "access_hash", 0)
+            }
+        if chat_id is None:
+            chat_id = getattr(event, "chat_id", None)
+        if message_id is None:
+            message_id = getattr(event, "message_id", None) or getattr(event, "id", None)
+
+    if chat_id is not None or inline_info is not None:
+        restart_logger.debug(f"Сохранение контекста перезагрузки: chat_id={chat_id}, message_id={message_id}, inline={inline_info is not None}")
+        save_restart_info(chat_id, message_id, custom_text=custom_text, inline_message_id=inline_info)
 
     target_client = client or get_main_client()
     if target_client:

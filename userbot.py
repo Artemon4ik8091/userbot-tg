@@ -342,21 +342,44 @@ async def notify_after_restart():
             text = f"✅ **Успешно перезагружен!**\n⏱ Заняло: `{elapsed:.2f} сек.`"
         
         edited = False
-        try:
-            await client.edit_message(restart_info["chat_id"], restart_info["message_id"], text)
-            edited = True
-        except Exception:
-            pass
 
-        if not edited:
+        # 1. Если сообщение было инлайн (из callback-кнопки встроенного бота)
+        inline_data = restart_info.get("inline_message_id")
+        if inline_data:
             bot = get_bot()
             if bot:
                 try:
-                    await bot.edit_message(restart_info["chat_id"], restart_info["message_id"], text)
+                    from telethon import types
+                    cls_name = inline_data.get("type", "InputBotInlineMessageID")
+                    cls = getattr(types, cls_name, types.InputBotInlineMessageID)
+                    input_id = cls(
+                        dc_id=inline_data.get("dc_id", 0),
+                        id=inline_data.get("id", 0),
+                        access_hash=inline_data.get("access_hash", 0)
+                    )
+                    await bot.edit_message(entity=input_id, text=text)
                     edited = True
-                except Exception:
-                    pass
+                except Exception as ex_inline:
+                    core_logger.debug(f"notify_after_restart inline edit exception: {ex_inline}")
 
+        # 2. Обычное сообщение в чате
+        if not edited and restart_info.get("chat_id") and restart_info.get("message_id"):
+            try:
+                await client.edit_message(restart_info["chat_id"], restart_info["message_id"], text)
+                edited = True
+            except Exception:
+                pass
+
+            if not edited:
+                bot = get_bot()
+                if bot:
+                    try:
+                        await bot.edit_message(restart_info["chat_id"], restart_info["message_id"], text)
+                        edited = True
+                    except Exception:
+                        pass
+
+        # 3. Fallback в ЛС владельцу через бота
         if not edited:
             await send_bot_notification(text)
     except Exception as e:

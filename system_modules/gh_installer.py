@@ -252,19 +252,19 @@ def build_card_view(session_id, index=0):
         prev_idx = (index - 1) % total
         next_idx = (index + 1) % total
         buttons.append([
-            Button.inline("◀️ Назад", f"gh_page_{session_id}_{prev_idx}".encode()),
-            Button.inline(f"📄 {index + 1}/{total}", f"gh_list_{session_id}".encode()),
-            Button.inline("Вперед ▶️", f"gh_page_{session_id}_{next_idx}".encode())
+            Button.inline("◀️ Назад", f"gh_page:{session_id}:{prev_idx}".encode()),
+            Button.inline(f"📄 {index + 1}/{total}", f"gh_list:{session_id}".encode()),
+            Button.inline("Вперед ▶️", f"gh_page:{session_id}:{next_idx}".encode())
         ])
 
     # Ряд 2: Кнопка установки и переход к общему списку
     action_btn_text = "🔄 Переустановить" if installed else "📥 Установить"
-    action_btn = Button.inline(action_btn_text, f"gh_inst_{session_id}_{mod['alias']}".encode())
+    action_btn = Button.inline(action_btn_text, f"gh_inst:{mod['alias']}".encode())
     
     if total > 1:
         buttons.append([
             action_btn,
-            Button.inline(f"📋 Списком ({total})", f"gh_list_{session_id}".encode())
+            Button.inline(f"📋 Списком ({total})", f"gh_list:{session_id}".encode())
         ])
     else:
         buttons.append([action_btn])
@@ -273,7 +273,7 @@ def build_card_view(session_id, index=0):
     row3 = []
     if mod.get("file_url"):
         row3.append(Button.url("🔗 Исходник", mod["file_url"]))
-    row3.append(Button.inline("❌ Закрыть", f"gh_close_{session_id}".encode()))
+    row3.append(Button.inline("❌ Закрыть", f"gh_close:{session_id}".encode()))
     buttons.append(row3)
 
     return text, buttons
@@ -309,7 +309,7 @@ def build_list_view(session_id):
     # Быстрые кнопки номеров страниц (по 5 в ряд)
     cur_row = []
     for i in range(total):
-        cur_row.append(Button.inline(f"{i + 1}", f"gh_page_{session_id}_{i}".encode()))
+        cur_row.append(Button.inline(f"{i + 1}", f"gh_page:{session_id}:{i}".encode()))
         if len(cur_row) == 5:
             buttons.append(cur_row)
             cur_row = []
@@ -318,8 +318,8 @@ def build_list_view(session_id):
 
     cur_idx = session.get("current_idx", 0)
     buttons.append([
-        Button.inline("🖼 Вернуться к карточкам", f"gh_page_{session_id}_{cur_idx}".encode()),
-        Button.inline("❌ Закрыть", f"gh_close_{session_id}".encode())
+        Button.inline("🖼 Вернуться к карточкам", f"gh_page:{session_id}:{cur_idx}".encode()),
+        Button.inline("❌ Закрыть", f"gh_close:{session_id}".encode())
     ])
 
     return text, buttons
@@ -433,11 +433,13 @@ async def perform_module_install(client, chat_id, message_id, package_alias, eve
                 await asyncio.sleep(1)
 
         if imported_successfully:
-            await update_status(f"⏳ `Подготовка и настройка пакета {package_alias}...`")
+            success_text = f"✅ **Пакет `{mod['name']}` (`{package_alias}`) успешно установлен!**\n🔄 *Перезапускаю юзербота для применения изменений...*"
+            await update_status(success_text)
+            await asyncio.sleep(0.3)
             logger.info(f"Пакет {package_alias} ({module_name}) успешно установлен. Перезапуск...")
-            success_text = f"✅ **Пакет `{mod['name']}` (`{package_alias}`) успешно установлен и готов к работе!**"
+            final_text = f"✅ **Пакет `{mod['name']}` (`{package_alias}`) успешно установлен и готов к работе!**"
             target_client = client or get_main_client()
-            await restart_userbot(target_client, chat_id, message_id, custom_text=success_text)
+            await restart_userbot(target_client, chat_id, message_id, custom_text=final_text, event=event)
         else:
             await update_status(f"❌ Не удалось запустить модуль `{module_name}`.")
 
@@ -452,12 +454,12 @@ async def perform_module_install(client, chat_id, message_id, package_alias, eve
 # ОБРАБОТЧИКИ НАЖАТИЙ НА ИНЛАЙН КНОПКИ
 # ==========================================
 
-@register_callback("gh_page_")
+@register_callback("gh_page:")
 async def cb_gh_page(event, data):
     """Переключение между карточками найденных модулей."""
-    payload = data.replace("gh_page_", "")
+    payload = data[len("gh_page:"):]
     try:
-        session_id, idx_str = payload.rsplit("_", 1)
+        session_id, idx_str = payload.rsplit(":", 1)
         idx = int(idx_str)
     except Exception:
         return await event.answer("⚠️ Ошибка навигации", alert=True)
@@ -474,10 +476,10 @@ async def cb_gh_page(event, data):
             logger.error(f"Ошибка редактирования карточки: {e}")
 
 
-@register_callback("gh_list_")
+@register_callback("gh_list:")
 async def cb_gh_list(event, data):
     """Переключение на просмотр списка всех найденных модулей."""
-    session_id = data.replace("gh_list_", "")
+    session_id = data[len("gh_list:"):]
     text, buttons = build_list_view(session_id)
     try:
         await event.edit(text, buttons=buttons, link_preview=False)
@@ -490,10 +492,10 @@ async def cb_gh_list(event, data):
             logger.error(f"Ошибка переключения на список: {e}")
 
 
-@register_callback("gh_close_")
+@register_callback("gh_close:")
 async def cb_gh_close(event, data):
     """Закрытие поискового меню."""
-    session_id = data.replace("gh_close_", "")
+    session_id = data[len("gh_close:"):]
     _search_sessions.pop(session_id, None)
     await event.answer("Закрыто")
     try:
@@ -505,20 +507,14 @@ async def cb_gh_close(event, data):
             pass
 
 
-@register_callback("gh_inst_")
+@register_callback("gh_inst:")
 async def cb_gh_install(event, data):
     """Кнопка 'Установить' / 'Переустановить' из карточки."""
     sender = await event.get_sender()
     if not is_authorized_user(sender.id):
         return await event.answer("⚠️ Установка модулей доступна только владельцу!", alert=True)
 
-    payload = data.replace("gh_inst_", "")
-    try:
-        session_id, alias = payload.split("_", 1)
-    except Exception:
-        alias = payload
-        session_id = ""
-
+    alias = data[len("gh_inst:"):]
     await event.answer(f"🚀 Запуск установки '{alias}'...")
     msg_id = getattr(event, "message_id", None) or getattr(event, "id", 0)
     await perform_module_install(get_main_client(), event.chat_id, msg_id, alias, event=event)

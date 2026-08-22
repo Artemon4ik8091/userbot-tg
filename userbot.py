@@ -88,7 +88,7 @@ def get_proxy_config(config):
 # ЗАГРУЗКА PRE-AUTH (INIT) МОДУЛЕЙ
 # ==========================================
 def get_init_modules():
-    base_dir = os.path.dirname(__file__)
+    base_dir = os.path.dirname(os.path.abspath(__file__))
     init_dir = os.path.join(base_dir, 'init_modules')
     
     if not os.path.exists(init_dir):
@@ -99,6 +99,7 @@ def get_init_modules():
     if init_dir not in sys.path:
         sys.path.insert(0, init_dir)
         
+    importlib.invalidate_caches()
     # Сортируем файлы, чтобы 00_auth_wizard.py загрузился первым
     files = sorted(f for f in os.listdir(init_dir) if f.endswith('.py') and not f.startswith('__'))
     for file in files:
@@ -294,9 +295,10 @@ async def auto_setup_bot(userbot_client, me):
 
 def load_modules():
     """Динамически подгружает все .py файлы из папок system_modules и modules"""
-    base_dir = os.path.dirname(__file__)
+    base_dir = os.path.dirname(os.path.abspath(__file__))
     folders_to_load = {'system_modules': True, 'modules': False}
 
+    importlib.invalidate_caches()
     for folder_name, is_system in folders_to_load.items():
         folder_path = os.path.join(base_dir, folder_name)
         if not os.path.exists(folder_path):

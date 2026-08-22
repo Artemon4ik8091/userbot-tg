@@ -17,7 +17,14 @@ set_module_meta(
 
 def get_modules_dir():
     # Если installer.py лежит в system_modules, то выходим на уровень выше и ищем папочку modules
-    return os.path.join(os.path.dirname(os.path.dirname(__file__)), 'modules')
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    mod_dir = os.path.join(base_dir, 'modules')
+    if not os.path.exists(mod_dir):
+        try:
+            os.makedirs(mod_dir, exist_ok=True)
+        except Exception:
+            pass
+    return mod_dir
 
 async def pip_install(package_name):
     """
@@ -58,10 +65,14 @@ async def install_module(client, event, args):
     
     try:
         modules_dir = get_modules_dir()
+        if modules_dir not in sys.path:
+            sys.path.insert(0, modules_dir)
+
         file_path = os.path.join(modules_dir, reply_msg.file.name)
         
         # Скачиваем файл модуля на диск
         await reply_msg.download_media(file=file_path)
+        importlib.invalidate_caches()
         
         # Читаем код файла, чтобы найти явные зависимости в комментариях
         with open(file_path, "r", encoding="utf-8") as f:
@@ -71,6 +82,7 @@ async def install_module(client, event, args):
         requires_match = re.search(r"^\s*#\s*requires:\s*(.+)$", code, re.MULTILINE | re.IGNORECASE)
         if requires_match:
             deps = [d.strip() for d in re.split(r"[\s,]+", requires_match.group(1)) if d.strip()]
+            deps = [d for d in deps if d and d != module_name]
             if deps:
                 await event.edit(f"📦 Найдена разметка зависимостей! Устанавливаю: `{', '.join(deps)}`...")
                 for dep in deps:
@@ -90,6 +102,7 @@ async def install_module(client, event, args):
 
         for attempt in range(max_install_attempts):
             try:
+                importlib.invalidate_caches()
                 if module_name in sys.modules:
                     importlib.reload(sys.modules[module_name])
                 else:
@@ -99,9 +112,9 @@ async def install_module(client, event, args):
                 break
                 
             except ModuleNotFoundError as err:
-                # Нам нужен именно отсутствующий модуль, а не внутренние импорты самого импортируемого пакета
+                # Нам нужен именно отсутствующий модуль, а не сам импортируемый пакет
                 missing_package = err.name
-                if not missing_package:
+                if not missing_package or missing_package == module_name:
                     raise err
 
                 await event.edit(f"🔍 Модуль требует либу `{missing_package}`. Устанавливаю её через pip...")

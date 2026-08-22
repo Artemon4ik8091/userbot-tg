@@ -16,6 +16,7 @@ if "--help" in sys.argv or "-h" in sys.argv:
 
 Доступные параметры запуска:
   -h, --help                  Показать это сообщение справки и выйти
+  --debug                     Включить подробный вывод логов всех модулей в консоль
   --no-web                    Использовать консольную настройку вместо веб-интерфейса
   --no-api                    Скрыть шаг ввода API Telegram (если уже настроено)
   --no-proxy                  Скрыть шаг настройки прокси в веб-интерфейсе
@@ -46,8 +47,15 @@ from registry import (
     is_rate_limited,
     get_rate_limit_remaining,
     apply_flood_wait,
-    check_cmd_rate_limit
+    check_cmd_rate_limit,
+    get_logger,
+    is_debug_mode,
+    set_main_client
 )
+
+core_logger = get_logger("Core")
+if is_debug_mode():
+    core_logger.info("🐛 Режим отладки (--debug) включен! Подробный лог модулей активирован.")
 
 def get_proxy_config(config):
     """Извлекает настройки прокси из конфигурации ядра"""
@@ -297,7 +305,7 @@ def load_modules():
                 
                 # Игнорируем installer.py и terminal.py, если запущен с флагом --host
                 if module_name in ("installer", "terminal") and "--host" in sys.argv:
-                    print(f"[Core] ⏭ Пропуск модуля '{module_name}' (активен флаг --host)")
+                    core_logger.info(f"⏭ Пропуск модуля '{module_name}' (активен флаг --host)")
                     continue
                     
                 try:
@@ -310,9 +318,9 @@ def load_modules():
                                 "name": module_name.capitalize(), "desc": "Системный", "commands": {}, "system": True
                             }
                     icon = "⚙️" if is_system else "📦"
-                    print(f"[Core] {icon} Модуль '{module_name}' загружен!")
+                    core_logger.info(f"{icon} Модуль '{module_name}' загружен!")
                 except Exception as e:
-                    print(f"[Core] ❌ Ошибка при загрузке '{module_name}': {e}")
+                    core_logger.error(f"Ошибка при загрузке '{module_name}': {e}")
 
 async def notify_after_restart():
     restart_info = pop_restart_info()
@@ -343,7 +351,8 @@ async def notify_after_restart():
 
         if not edited:
             await send_bot_notification(text)
-    except Exception as e: pass
+    except Exception as e:
+        core_logger.debug(f"notify_after_restart exception: {e}")
 
 async def handle_incoming_messages(event):
     if not event.out: return
@@ -353,18 +362,24 @@ async def handle_incoming_messages(event):
         parts = text.split(maxsplit=1)
         cmd, args = parts[0][1:], parts[1] if len(parts) > 1 else ""
         if cmd in modules_repo["commands"]:
+            core_logger.debug(f"⚡ Вызов команды .{cmd} (аргументы: '{args}') в чате {event.chat_id}")
             if is_rate_limited():
                 rem = get_rate_limit_remaining()
-                mins, secs = divmod(rem, 60)
+                core_logger.warning(f"Лимит API! Запрос .{cmd} заблокирован (осталось: {rem} сек.)")
                 await event.edit(f"⚠️ **Лимит API!**\n⏱ Осталось: `{rem} сек.`")
                 return
             try:
                 await check_cmd_rate_limit()
+                start_t = time.perf_counter()
                 await modules_repo["commands"][cmd](client, event, args)
+                exec_dur = time.perf_counter() - start_t
+                core_logger.debug(f"✅ Команда .{cmd} выполнена за {exec_dur:.3f}с")
             except errors.FloodWaitError as e:
+                core_logger.error(f"FloodWait в .{cmd}: {e.seconds} сек.")
                 await apply_flood_wait(e.seconds, source=f"Команда .{cmd}")
                 await event.edit(f"⚠️ **FloodWait:** `{e.seconds} сек.`")
             except Exception as e:
+                core_logger.error(f"Ошибка при выполнении .{cmd}: {e}")
                 await event.edit(f"**Ошибка [.{cmd}]:**\n`{e}`")
 
 async def send_bot_status_msg(event):
@@ -384,6 +399,7 @@ def setup_core_bot_handlers(bot_client):
     @bot_client.on(events.InlineQuery)
     async def inline_handler(event):
         query = event.text.strip()
+        core_logger.debug(f"🔍 Инлайн-запрос: '{query}' от {event.sender_id}")
         if query in inline_payload_cache:
             payload = inline_payload_cache.pop(query)
             await event.answer([event.builder.article("Вывод", text=payload["text"], buttons=payload.get("buttons"))], cache_time=0)
@@ -393,20 +409,26 @@ def setup_core_bot_handlers(bot_client):
     @bot_client.on(events.CallbackQuery)
     async def callback_handler(event):
         data = event.data.decode("utf-8") if isinstance(event.data, bytes) else str(event.data)
+        core_logger.debug(f"🔘 Нажата инлайн-кнопка (data: '{data}') от пользователя {event.sender_id}")
         if data == "bot_status": return await (event.answer("Загрузка...") or send_bot_status_msg(event))
         elif data == "bot_ping": return await (event.answer("Замер...") or event.respond("🏓 ПОНГ!"))
         
         for prefix in sorted(callback_handlers.keys(), key=len, reverse=True):
             if data.startswith(prefix):
-                try: await callback_handlers[prefix](event, data)
+                try:
+                    await callback_handlers[prefix](event, data)
+                    core_logger.debug(f"✅ Callback '{prefix}' успешно обработан")
                 except errors.MessageNotModifiedError: await event.answer()
-                except Exception as e: await event.answer(f"Ошибка: {e}", alert=True)
+                except Exception as e:
+                    core_logger.error(f"Ошибка в callback '{prefix}': {e}")
+                    await event.answer(f"Ошибка: {e}", alert=True)
                 return
 
     @bot_client.on(events.NewMessage(incoming=True))
     async def bot_pm_handler(event):
         if not event.is_private or (get_owner_id() and event.sender_id != get_owner_id()): return
         text = event.raw_text.strip()
+        core_logger.debug(f"📩 Сообщение боту в ЛС: '{text}' от {event.sender_id}")
         if text.startswith("/start") or text.startswith("/help"):
             me = await bot_client.get_me()
             await event.respond(f"👋 **Привет! Я бот UBTG.** (@{me.username})\n\n`/status` — Статус\n`/ping` — Отклик\n`/restart` — Перезапуск",
@@ -418,6 +440,7 @@ def setup_core_bot_handlers(bot_client):
             await restart_userbot(client, event.chat_id, msg.id)
 
 async def main():
+    set_main_client(client)
     await client.connect()
 
     # 2. Этап асинхронных Pre-Auth модулей (Генерация QR, web ui и тд.)
@@ -427,12 +450,12 @@ async def main():
 
     # Проверка, что после всех init-модулей мы действительно авторизованы
     if not await client.is_user_authorized():
-        print("[Core] ❌ Ошибка: Клиент не авторизован после выполнения init-модулей!")
+        core_logger.error("Клиент не авторизован после выполнения init-модулей!")
         sys.exit(1)
 
     me = await client.get_me()
     set_owner_id(me.id)
-    print(f"[Core] 👤 Владелец: {me.first_name} (ID: {me.id})")
+    core_logger.info(f"👤 Владелец: {me.first_name} (ID: {me.id})")
 
     bot_token, bot_username, is_first_run = await auto_setup_bot(client, me)
     try:
@@ -445,17 +468,19 @@ async def main():
         
     set_bot(bot_client, bot_username)
     setup_core_bot_handlers(bot_client)
-    print(f"[Core] 🤖 Бот активен (@{bot_username})!")
+    core_logger.info(f"🤖 Бот активен (@{bot_username})!")
 
     try: await client.send_message(f"@{bot_username}", "/start"); await asyncio.sleep(0.5)
     except: pass
 
-    print("\n[Core] Загружаем модули...")
+    core_logger.info("Загружаем модули...")
     load_modules()
 
     client.add_event_handler(handle_incoming_messages, events.NewMessage(outgoing=True))
-    print(f"\n[Core] Запущено команд: {len(modules_repo['commands'])}")
-    for task in modules_repo["background_tasks"]: asyncio.create_task(task(client))
+    core_logger.info(f"Запущено команд: {len(modules_repo['commands'])}")
+    for task in modules_repo["background_tasks"]:
+        core_logger.debug(f"🚀 Старт фоновой задачи: {getattr(task, '__name__', str(task))}")
+        asyncio.create_task(task(client))
     
     await notify_after_restart()
 

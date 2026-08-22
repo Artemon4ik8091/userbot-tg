@@ -4,7 +4,9 @@ import re
 import asyncio
 import importlib
 import traceback
-from registry import register_cmd, set_module_meta, modules_repo, restart_userbot
+from registry import register_cmd, set_module_meta, modules_repo, restart_userbot, get_logger
+
+logger = get_logger("Installer")
 
 # Обновляем метаданные модуля (он системный, удалять нельзя)
 set_module_meta(
@@ -22,7 +24,7 @@ async def pip_install(package_name):
     Асинхронно устанавливает пакет через pip.
     Возвращает кортеж (success: bool, error_msg: str)
     """
-    print(f"[Installer] Запуск установки пакета: {package_name}")
+    logger.info(f"Запуск установки пакета: {package_name}")
     process = await asyncio.create_subprocess_exec(
         sys.executable, "-m", "pip", "install", package_name,
         stdout=asyncio.subprocess.PIPE,

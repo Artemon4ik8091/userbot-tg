@@ -15,8 +15,12 @@ from registry import (
     get_bot_username,
     get_config,
     set_config,
-    init_config
+    init_config,
+    get_logger,
+    get_main_client
 )
+
+logger = get_logger("Update")
 
 # Системный модуль обновления юзербота (удалять нельзя)
 set_module_meta(
@@ -38,6 +42,8 @@ async def run_git_cmd(*args, timeout=45):
     Асинхронно выполняет команду git в директории юзербота.
     Возвращает (returncode: int, stdout: str, stderr: str).
     """
+    cmd_str = f"git {' '.join(args)}"
+    logger.debug(f"Выполнение команды: {cmd_str}")
     try:
         process = await asyncio.create_subprocess_exec(
             "git",
@@ -49,14 +55,17 @@ async def run_git_cmd(*args, timeout=45):
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
         out_str = stdout.decode("utf-8", errors="replace").strip()
         err_str = stderr.decode("utf-8", errors="replace").strip()
+        logger.debug(f"Результат [{cmd_str}]: code={process.returncode}, out={out_str[:150]}, err={err_str[:150]}")
         return process.returncode, out_str, err_str
     except asyncio.TimeoutError:
         try:
             process.kill()
         except Exception:
             pass
-        return -1, "", "Превышено время ожидания (таймаут 45с)"
+        logger.error(f"Превышено время ожидания ({timeout}с) для команды: {cmd_str}")
+        return -1, "", f"Превышено время ожидания (таймаут {timeout}с)"
     except Exception as e:
+        logger.error(f"Исключение при выполнении {cmd_str}: {e}")
         return -1, "", str(e)
 
 
@@ -66,8 +75,10 @@ async def run_pip_requirements(timeout=120):
     """
     req_file = os.path.join(BASE_DIR, "requirements.txt")
     if not os.path.exists(req_file):
+        logger.debug("requirements.txt не найден, пропускаю pip")
         return True, "requirements.txt не найден"
 
+    logger.debug("Запуск установки / обновления зависимостей из requirements.txt...")
     try:
         process = await asyncio.create_subprocess_exec(
             sys.executable,
@@ -82,16 +93,20 @@ async def run_pip_requirements(timeout=120):
         )
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
         if process.returncode == 0:
+            logger.debug("Зависимости pip успешно обновлены")
             return True, stdout.decode("utf-8", errors="replace").strip()
         err = stderr.decode("utf-8", errors="replace").strip() or stdout.decode("utf-8", errors="replace").strip()
+        logger.warning(f"Предупреждение/ошибка pip: {err[:200]}")
         return False, err
     except asyncio.TimeoutError:
         try:
             process.kill()
         except Exception:
             pass
-        return False, "Превышен таймаут установки зависимостей (120с)"
+        logger.error(f"Превышен таймаут установки зависимостей ({timeout}с)")
+        return False, f"Превышен таймаут установки зависимостей ({timeout}с)"
     except Exception as e:
+        logger.error(f"Исключение при запуске pip: {e}")
         return False, str(e)
 
 
@@ -111,19 +126,21 @@ async def ensure_git_setup():
     Возвращает (success: bool, error_message: str).
     """
     if not is_git_installed():
+        logger.error("Git не установлен в операционной системе!")
         return False, "В системе не установлен `git`. Установите его (`sudo apt install git` / `pkg install git`)."
 
     if not is_git_repo():
-        # Попытка инициализации git, если папка была скачана архивом
+        logger.info("Git репозиторий не инициализирован. Выполняю git init...")
         code, _, err = await run_git_cmd("init")
         if code != 0:
+            logger.error(f"Не удалось инициализировать git: {err}")
             return False, f"Не удалось инициализировать git: `{err}`"
 
         await run_git_cmd("remote", "add", "origin", OFFICIAL_REPO_URL)
     else:
-        # Проверяем remotes и принудительно фиксируем официальный origin
         code, remotes, _ = await run_git_cmd("remote")
         if "origin" not in remotes.split():
+            logger.debug(f"Добавляю origin: {OFFICIAL_REPO_URL}")
             await run_git_cmd("remote", "add", "origin", OFFICIAL_REPO_URL)
         else:
             await run_git_cmd("remote", "set-url", "origin", OFFICIAL_REPO_URL)
@@ -163,13 +180,16 @@ async def check_updates_state():
     Выполняет проверку обновлений через fetch и сравнение HEAD с origin/branch.
     Возвращает словарь с результатами проверки.
     """
+    logger.debug("Запуск проверки наличия обновлений...")
     ready, err = await ensure_git_setup()
     if not ready:
         return {"ok": False, "error": err}
 
     branch = await get_current_branch()
+    logger.debug(f"Текущая ветка: {branch}. Выполняю git fetch...")
     code, _, fetch_err = await run_git_cmd("fetch", "origin", branch, timeout=30)
     if code != 0:
+        logger.error(f"Ошибка при git fetch: {fetch_err}")
         return {"ok": False, "error": f"Не удалось связаться с GitHub (`git fetch`):\n`{fetch_err}`"}
 
     code_behind, behind_count_str, _ = await run_git_cmd("rev-list", "--count", f"HEAD..origin/{branch}")
@@ -179,6 +199,7 @@ async def check_updates_state():
     ahead_count = int(ahead_count_str) if (code_ahead == 0 and ahead_count_str.isdigit()) else 0
 
     current_commit = await get_commit_info("HEAD")
+    logger.debug(f"Состояние: behind={behind_count}, ahead={ahead_count}, commit={current_commit.get('short_hash') if current_commit else 'None'}")
 
     new_commits_log = ""
     if behind_count > 0:
@@ -296,6 +317,9 @@ async def run_update_sequence(client, chat_id, message_id, branch, force=False, 
     """
     Выполняет последовательность скачивания обновления, установки зависимостей и перезапуска.
     """
+    target_client = client or get_main_client()
+    logger.info(f"🚀 Запуск процесса обновления (ветка: {branch}, force={force})...")
+
     async def update_status(msg_text):
         if event:
             try:
@@ -303,53 +327,68 @@ async def run_update_sequence(client, chat_id, message_id, branch, force=False, 
                 return
             except Exception:
                 pass
-        await edit_any_message(client, chat_id, message_id, msg_text, buttons=None)
+        await edit_any_message(target_client, chat_id, message_id, msg_text, buttons=None)
 
-    await update_status("⏳ **Проверяю и скачиваю обновление из GitHub...**")
+    try:
+        await update_status("⏳ **Проверяю и скачиваю обновление из GitHub...**")
 
-    # 1. Fetch
-    code, _, fetch_err = await run_git_cmd("fetch", "origin", branch)
-    if code != 0:
-        return await update_status(f"❌ Ошибка подключения к GitHub (`git fetch`):\n`{fetch_err}`")
-
-    # 2. Pull или Reset (в зависимости от режима force)
-    if force:
-        code, _, err = await run_git_cmd("reset", "--hard", f"origin/{branch}")
+        # 1. Fetch
+        logger.debug(f"Выполняю git fetch origin {branch}...")
+        code, _, fetch_err = await run_git_cmd("fetch", "origin", branch)
         if code != 0:
-            return await update_status(f"❌ Ошибка `git reset`:\n`{err}`")
-        await run_git_cmd("clean", "-fd", "-e", "core_conf.json", "-e", "Global_config.json", "-e", "*.session", "-e", "*.session-journal")
-    else:
-        code, pull_out, pull_err = await run_git_cmd("pull", "origin", branch)
-        if code != 0:
-            conflict_hint = ""
-            if "conflict" in (pull_err + pull_out).lower() or "local changes" in (pull_err + pull_out).lower():
-                conflict_hint = (
-                    "\n\n💡 **Обнаружен конфликт с локальными файлами!**\n"
-                    "Используйте `.update force`, чтобы перезаписать локальные изменения версией из GitHub."
-                )
-            return await update_status(f"❌ **Ошибка при выполнении git pull:**\n`{pull_err or pull_out}`{conflict_hint}")
+            logger.error(f"git fetch origin {branch} завершился с ошибкой: {fetch_err}")
+            return await update_status(f"❌ Ошибка подключения к GitHub (`git fetch`):\n`{fetch_err}`")
 
-    # 3. Обновление зависимостей
-    await update_status("📦 `Обновляю зависимости из requirements.txt...`")
-    pip_ok, pip_msg = await run_pip_requirements()
-    if not pip_ok:
-        await update_status(f"⚠️ Предупреждение pip при установке библиотек:\n`{pip_msg[:300]}`\n\nПродолжаю перезапуск...")
-        await asyncio.sleep(2)
+        # 2. Pull или Reset (в зависимости от режима force)
+        if force:
+            logger.info("Режим force: сброс локальных изменений (git reset --hard)...")
+            code, _, err = await run_git_cmd("reset", "--hard", f"origin/{branch}")
+            if code != 0:
+                logger.error(f"git reset --hard завершился с ошибкой: {err}")
+                return await update_status(f"❌ Ошибка `git reset`:\n`{err}`")
+            await run_git_cmd("clean", "-fd", "-e", "core_conf.json", "-e", "Global_config.json", "-e", "*.session", "-e", "*.session-journal")
+        else:
+            logger.info(f"Выполняю git pull origin {branch}...")
+            code, pull_out, pull_err = await run_git_cmd("pull", "origin", branch)
+            if code != 0:
+                logger.error(f"git pull завершился с ошибкой (code={code}): out='{pull_out}', err='{pull_err}'")
+                conflict_hint = ""
+                if "conflict" in (pull_err + pull_out).lower() or "local changes" in (pull_err + pull_out).lower():
+                    conflict_hint = (
+                        "\n\n💡 **Обнаружен конфликт с локальными файлами!**\n"
+                        "Используйте `.update force`, чтобы перезаписать локальные изменения версией из GitHub."
+                    )
+                return await update_status(f"❌ **Ошибка при выполнении git pull:**\n`{pull_err or pull_out}`{conflict_hint}")
 
-    # 4. Получаем данные о новом коммите
-    new_commit = await get_commit_info("HEAD")
-    commit_badge = f"`[{new_commit['short_hash']}]` {new_commit['message']}" if new_commit else "Актуальная версия"
+        # 3. Обновление зависимостей
+        logger.info("Проверка и установка зависимостей из requirements.txt...")
+        await update_status("📦 `Обновляю зависимости из requirements.txt...`")
+        pip_ok, pip_msg = await run_pip_requirements()
+        if not pip_ok:
+            logger.warning(f"Предупреждение pip: {pip_msg[:200]}")
+            await update_status(f"⚠️ Предупреждение pip при установке библиотек:\n`{pip_msg[:300]}`\n\nПродолжаю перезапуск...")
+            await asyncio.sleep(2)
 
-    restart_text = (
-        f"🎉 **Юзербот успешно обновлен{' (force)' if force else ''} и перезапущен!**\n\n"
-        f"🌿 **Ветка:** `{branch}`\n"
-        f"📌 **Коммит:** {commit_badge}\n"
-        f"👤 **Автор:** `{new_commit['author'] if new_commit else 'GitHub'}`"
-    )
+        # 4. Получаем данные о новом коммите
+        new_commit = await get_commit_info("HEAD")
+        commit_badge = f"`[{new_commit['short_hash']}]` {new_commit['message']}" if new_commit else "Актуальная версия"
+        logger.info(f"Актуальный коммит: {commit_badge}")
 
-    await update_status("🔄 Перезапускаю юзербота для применения всех изменений...")
-    set_config("module_update", "snoozed_hash", "")
-    await restart_userbot(client, chat_id, message_id, custom_text=restart_text)
+        restart_text = (
+            f"🎉 **Юзербот успешно обновлен{' (force)' if force else ''} и перезапущен!**\n\n"
+            f"🌿 **Ветка:** `{branch}`\n"
+            f"📌 **Коммит:** {commit_badge}\n"
+            f"👤 **Автор:** `{new_commit['author'] if new_commit else 'GitHub'}`"
+        )
+
+        logger.info("Подготовка к перезагрузке юзербота...")
+        await update_status("🔄 Перезапускаю юзербота для применения всех изменений...")
+        set_config("module_update", "snoozed_hash", "")
+        await restart_userbot(target_client, chat_id, message_id, custom_text=restart_text)
+
+    except Exception as e:
+        logger.error(f"Непредвиденное исключение при обновлении: {e}")
+        await update_status(f"❌ **Ошибка обновления:**\n`{e}`")
 
 
 # ==========================================
@@ -369,12 +408,14 @@ async def cb_upd_apply(event, data):
     """Кнопка 'Обновить' в инлайн-сообщении чата."""
     sender = await event.get_sender()
     if not is_authorized_user(sender.id):
+        logger.warning(f"Неавторизованная попытка обновления от {sender.id}")
         return await event.answer("⚠️ Действие доступно только владельцу!", alert=True)
 
+    logger.info(f"Нажата кнопка 'Обновить' пользователем {sender.id}")
     await event.answer("🚀 Запуск обновления...")
     msg_id = getattr(event, "message_id", None) or getattr(event, "id", 0)
     branch = await get_current_branch()
-    await run_update_sequence(None, event.chat_id, msg_id, branch, force=False, event=event)
+    await run_update_sequence(get_main_client(), event.chat_id, msg_id, branch, force=False, event=event)
 
 
 @register_callback("upd_cancel")
@@ -384,6 +425,7 @@ async def cb_upd_cancel(event, data):
     if not is_authorized_user(sender.id):
         return await event.answer("⚠️ Действие доступно только владельцу!", alert=True)
 
+    logger.info(f"Обновление отменено пользователем {sender.id}")
     await event.answer("Отменено")
     text = (
         "❌ **Проверка обновлений завершена.**\n\n"
@@ -403,6 +445,7 @@ async def cb_upd_recheck(event, data):
     if not is_authorized_user(sender.id):
         return await event.answer("⚠️ Действие доступно только владельцу!", alert=True)
 
+    logger.info(f"Повторная проверка обновлений пользователем {sender.id}")
     await event.answer("🔄 Проверяю обновления...")
     try:
         await event.edit("🔄 `Проверяю наличие обновлений на GitHub...`", buttons=None)
@@ -431,12 +474,14 @@ async def cb_bot_upd_apply(event, data):
     """Кнопка 'Обновить' в сообщении от Telegram-бота."""
     sender = await event.get_sender()
     if not is_authorized_user(sender.id):
+        logger.warning(f"Неавторизованная попытка обновления от {sender.id}")
         return await event.answer("⚠️ Действие доступно только владельцу!", alert=True)
 
+    logger.info(f"Нажата кнопка 'Обновить' через бота пользователем {sender.id}")
     await event.answer("🚀 Запуск обновления...")
     msg_id = getattr(event, "message_id", None) or getattr(event, "id", 0)
     branch = await get_current_branch()
-    await run_update_sequence(None, event.chat_id, msg_id, branch, force=False, event=event)
+    await run_update_sequence(get_main_client(), event.chat_id, msg_id, branch, force=False, event=event)
 
 
 @register_callback("bot_upd_snooze")
@@ -480,6 +525,7 @@ async def auto_update_checker(client):
     Фоновый процесс: каждые 15 минут проверяет наличие обновлений в репозитории.
     При обнаружении отправляет сообщение владельцу от имени встроенного бота с кнопками.
     """
+    logger.debug("Запуск фонового чекера авто-обновлений...")
     # Ждем 60 секунд после запуска, чтобы ядро успело полностью инициализироваться
     await asyncio.sleep(60)
     last_notified_hash = None
@@ -498,6 +544,7 @@ async def auto_update_checker(client):
                     behind_count = int(behind_str) if (code_cnt == 0 and behind_str.isdigit()) else 0
 
                     snoozed_hash = get_config("module_update", "snoozed_hash", "")
+                    logger.debug(f"Фоновый чек: behind={behind_count}, remote={remote_hash[:7] if remote_hash else 'None'}, snoozed={snoozed_hash[:7] if snoozed_hash else 'None'}")
 
                     # Проверяем:
                     # 1. Есть коммиты позади (behind_count > 0)
@@ -511,6 +558,7 @@ async def auto_update_checker(client):
                         and remote_hash != snoozed_hash
                         and remote_hash != last_notified_hash
                     ):
+                        logger.info(f"Обнаружено {behind_count} новых коммитов в GitHub! Отправка уведомления владельцу...")
                         code_log, new_commits_log, _ = await run_git_cmd(
                             "log",
                             f"HEAD..origin/{branch}",
@@ -544,10 +592,11 @@ async def auto_update_checker(client):
                             try:
                                 await bot.send_message(owner_id, msg, buttons=buttons)
                                 last_notified_hash = remote_hash
+                                logger.info("Уведомление об обновлении отправлено в ЛС боту владельца.")
                             except Exception as ex:
-                                print(f"[AutoUpdate] ⚠️ Ошибка отправки уведомления: {ex}")
+                                logger.warning(f"Ошибка отправки уведомления ботом: {ex}")
         except Exception as e:
-            print(f"[AutoUpdate] ⚠️ Ошибка в фоновом чеке обновлений: {e}")
+            logger.error(f"Ошибка в фоновом чеке обновлений: {e}")
 
         # Проверка каждые 15 минут
         await asyncio.sleep(15 * 60)

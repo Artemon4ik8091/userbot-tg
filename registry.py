@@ -8,6 +8,73 @@ import asyncio
 from datetime import datetime, timedelta
 from telethon import errors
 
+# --- СИСТЕМА ЛОГИРОВАНИЯ И РЕЖИМ ОТЛАДКИ (--debug) ---
+DEBUG_MODE = "--debug" in sys.argv
+
+def is_debug_mode():
+    """Возвращает True, если юзербот запущен с флагом --debug."""
+    return DEBUG_MODE
+
+def set_debug_mode(enabled: bool):
+    """Вручную переключает режим отладки."""
+    global DEBUG_MODE
+    DEBUG_MODE = bool(enabled)
+
+class ModuleLogger:
+    """Логгер для модулей и ядра с поддержкой уровней, цветов и флага --debug."""
+    def __init__(self, name="Core"):
+        self.name = name
+
+    def _log(self, level_name, color, icon, msg):
+        now_str = datetime.now().strftime("%H:%M:%S")
+        print(f"\033[90m{now_str}\033[0m {color}[{icon} {level_name}]\033[0m \033[1;34m[{self.name}]\033[0m {msg}")
+
+    def debug(self, msg):
+        if DEBUG_MODE:
+            self._log("DEBUG", "\033[36m", "🔍", msg)
+
+    def info(self, msg):
+        self._log("INFO", "\033[32m", "ℹ️", msg)
+
+    def warning(self, msg):
+        self._log("WARN", "\033[33m", "⚠️", msg)
+
+    def error(self, msg):
+        self._log("ERROR", "\033[31m", "❌", msg)
+
+    def success(self, msg):
+        self._log("OK", "\033[32m", "✅", msg)
+
+def get_logger(module_name="Core"):
+    """Возвращает экземпляр ModuleLogger для указанного модуля."""
+    return ModuleLogger(module_name)
+
+logger = get_logger("Core")
+
+def log_debug(module_name, msg):
+    get_logger(module_name).debug(msg)
+
+def log_info(module_name, msg):
+    get_logger(module_name).info(msg)
+
+def log_warning(module_name, msg):
+    get_logger(module_name).warning(msg)
+
+def log_error(module_name, msg):
+    get_logger(module_name).error(msg)
+
+# --- ГЛАВНЫЙ КЛИЕНТ ЮЗЕРБОТА ---
+main_client_instance = None
+
+def set_main_client(client):
+    """Сохраняет главный экземпляр TelegramClient юзербота в реестре."""
+    global main_client_instance
+    main_client_instance = client
+
+def get_main_client():
+    """Возвращает главный экземпляр TelegramClient юзербота."""
+    return main_client_instance
+
 # --- СИСТЕМА ОГРАНИЧЕНИЙ И ЗАЩИТЫ ОТ СПАМБАНА (Rate Limiter / FloodWait) ---
 rate_limiter_state = {
     "until": 0.0,
@@ -241,28 +308,54 @@ def pop_restart_info():
 
 async def restart_userbot(client=None, chat_id=None, message_id=None, custom_text=None):
     """
-    Выполняет полную перезагрузку юзербота (полный перезапуск Python-процесса точно так же, как модуль restart).
+    Выполняет полную перезагрузку юзербота (полный перезапуск Python-процесса).
     Сохраняет данные для восстановления контекста/редактирования исходного сообщения после перезапуска.
     """
+    restart_logger = get_logger("Restart")
+    restart_logger.info("🔄 Инициализация перезагрузки юзербота...")
+
     if chat_id is not None and message_id is not None:
+        restart_logger.debug(f"Сохранение контекста перезагрузки: chat_id={chat_id}, message_id={message_id}")
         save_restart_info(chat_id, message_id, custom_text=custom_text)
 
-    if client:
+    target_client = client or get_main_client()
+    if target_client:
+        restart_logger.debug("Отключение клиента Telegram юзербота...")
         try:
-            await client.disconnect()
-        except Exception:
-            pass
+            if hasattr(target_client, 'is_connected') and target_client.is_connected():
+                await target_client.disconnect()
+            elif hasattr(target_client, 'disconnect'):
+                await target_client.disconnect()
+        except Exception as e:
+            restart_logger.debug(f"Исключение при отключении клиента: {e}")
 
     bot = get_bot()
     if bot:
+        restart_logger.debug("Отключение Telegram-бота ядра...")
         try:
-            await bot.disconnect()
-        except Exception:
-            pass
+            if hasattr(bot, 'is_connected') and bot.is_connected():
+                await bot.disconnect()
+            elif hasattr(bot, 'disconnect'):
+                await bot.disconnect()
+        except Exception as e:
+            restart_logger.debug(f"Исключение при отключении бота: {e}")
 
-    python = sys.executable
+    python = sys.executable or "python3"
     script = os.path.abspath(sys.argv[0])
-    os.execv(python, [python, script] + sys.argv[1:])
+    args = [python, script] + sys.argv[1:]
+
+    restart_logger.info(f"🚀 Перезапуск процесса: {' '.join(args)}")
+
+    try:
+        os.execv(python, args)
+    except Exception as e:
+        restart_logger.error(f"os.execv завершился с ошибкой: {e}. Запуск через subprocess fallback...")
+        try:
+            import subprocess
+            subprocess.Popen(args)
+            sys.exit(0)
+        except Exception as sub_err:
+            restart_logger.error(f"Критическая ошибка fallback перезапуска: {sub_err}")
 
 
 # --- ХРАНИЛИЩЕ БОТА, ВЛАДЕЛЬЦА И ИНЛАЙН ИНФРАСТРУКТУРЫ ---

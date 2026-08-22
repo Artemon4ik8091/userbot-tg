@@ -7,6 +7,7 @@ import importlib
 import random
 import re
 import psutil
+import traceback
 from datetime import datetime
 from telethon import TelegramClient, events, errors, Button
 from telethon.sessions import MemorySession
@@ -50,7 +51,10 @@ from registry import (
     check_cmd_rate_limit,
     get_logger,
     is_debug_mode,
-    set_main_client
+    set_main_client,
+    ensure_log_chat,
+    get_log_chat_id,
+    set_log_chat_id
 )
 
 core_logger = get_logger("Core")
@@ -320,7 +324,7 @@ def load_modules():
                     icon = "⚙️" if is_system else "📦"
                     core_logger.info(f"{icon} Модуль '{module_name}' загружен!")
                 except Exception as e:
-                    core_logger.error(f"Ошибка при загрузке '{module_name}': {e}")
+                    core_logger.error(f"Ошибка при загрузке модуля '{module_name}':\n{traceback.format_exc()}")
 
 async def notify_after_restart():
     restart_info = pop_restart_info()
@@ -375,11 +379,11 @@ async def handle_incoming_messages(event):
                 exec_dur = time.perf_counter() - start_t
                 core_logger.debug(f"✅ Команда .{cmd} выполнена за {exec_dur:.3f}с")
             except errors.FloodWaitError as e:
-                core_logger.error(f"FloodWait в .{cmd}: {e.seconds} сек.")
+                core_logger.error(f"FloodWait в .{cmd}: {e.seconds} сек. (чат {event.chat_id})")
                 await apply_flood_wait(e.seconds, source=f"Команда .{cmd}")
                 await event.edit(f"⚠️ **FloodWait:** `{e.seconds} сек.`")
             except Exception as e:
-                core_logger.error(f"Ошибка при выполнении .{cmd}: {e}")
+                core_logger.error(f"Ошибка при выполнении команды [.{cmd}] в чате {event.chat_id}:\n{traceback.format_exc()}")
                 await event.edit(f"**Ошибка [.{cmd}]:**\n`{e}`")
 
 async def send_bot_status_msg(event):
@@ -420,7 +424,7 @@ def setup_core_bot_handlers(bot_client):
                     core_logger.debug(f"✅ Callback '{prefix}' успешно обработан")
                 except errors.MessageNotModifiedError: await event.answer()
                 except Exception as e:
-                    core_logger.error(f"Ошибка в callback '{prefix}': {e}")
+                    core_logger.error(f"Ошибка в callback '{prefix}' (data: '{data}'):\n{traceback.format_exc()}")
                     await event.answer(f"Ошибка: {e}", alert=True)
                 return
 
@@ -438,6 +442,16 @@ def setup_core_bot_handlers(bot_client):
         elif text.startswith("/restart"):
             msg = await event.respond("🔄 **Перезапуск...**")
             await restart_userbot(client, event.chat_id, msg.id)
+
+async def _run_bg_task_safe(task_func, client):
+    """Обертка для безопасного запуска фоновых задач с логированием ошибок."""
+    task_name = getattr(task_func, '__name__', str(task_func))
+    try:
+        await task_func(client)
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        core_logger.error(f"Ошибка в фоновой задаче '{task_name}':\n{traceback.format_exc()}")
 
 async def main():
     set_main_client(client)
@@ -470,6 +484,13 @@ async def main():
     setup_core_bot_handlers(bot_client)
     core_logger.info(f"🤖 Бот активен (@{bot_username})!")
 
+    # === НАСТРОЙКА ЧАТА ЛОГОВ ubtg-logs ===
+    try:
+        log_chat_id = await ensure_log_chat(client, bot_client, bot_username)
+        core_logger.info(f"📁 Чат логов ubtg-logs готов (ID: {log_chat_id})")
+    except Exception as ex_chat:
+        core_logger.error(f"Не удалось инициализировать чат ubtg-logs: {ex_chat}")
+
     try: await client.send_message(f"@{bot_username}", "/start"); await asyncio.sleep(0.5)
     except: pass
 
@@ -480,7 +501,7 @@ async def main():
     core_logger.info(f"Запущено команд: {len(modules_repo['commands'])}")
     for task in modules_repo["background_tasks"]:
         core_logger.debug(f"🚀 Старт фоновой задачи: {getattr(task, '__name__', str(task))}")
-        asyncio.create_task(task(client))
+        asyncio.create_task(_run_bg_task_safe(task, client))
     
     await notify_after_restart()
 

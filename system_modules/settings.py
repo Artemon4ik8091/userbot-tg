@@ -35,6 +35,7 @@ async def settings_cmd(client, event, args):
     config = load_core_config()
     bot_username = config.get("bot_username", "Не привязан")
     app_id = config.get("app_id", "Н/Д")
+    log_chat_id = config.get("log_chat_id", "ubtg-logs (не настроен)")
     proxy = config.get("proxy")
     
     if proxy and isinstance(proxy, dict) and proxy.get("addr") and proxy.get("port"):
@@ -46,6 +47,7 @@ async def settings_cmd(client, event, args):
     text = (
         "⚙️ **Системные Настройки Юзербота**\n\n"
         f"🤖 **Встроенный бот:** `@{bot_username}`\n"
+        f"📁 **Чат логов ошибок:** `{log_chat_id}`\n"
         f"🔑 **App ID:** `{app_id}`\n"
         f"🌐 **Прокси:** `{proxy_status}`\n\n"
         "🛠 **Команды управления:**\n"

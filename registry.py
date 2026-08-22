@@ -20,8 +20,207 @@ def set_debug_mode(enabled: bool):
     global DEBUG_MODE
     DEBUG_MODE = bool(enabled)
 
+# --- ХРАНИЛИЩЕ И ОТПРАВКА ЛОГОВ В ЧАТ ubtg-logs ---
+log_chat_state = {
+    "chat_id": None
+}
+_pending_log_errors = []
+_is_sending_log = False
+
+def set_log_chat_id(chat_id):
+    """Устанавливает ID чата ubtg-logs и сбрасывает накопившиеся ошибки."""
+    global _pending_log_errors
+    log_chat_state["chat_id"] = chat_id
+    if chat_id and _pending_log_errors:
+        bot = get_bot()
+        if bot:
+            loop = None
+            try:
+                loop = asyncio.get_event_loop()
+            except Exception:
+                pass
+            if loop and loop.is_running():
+                for item in list(_pending_log_errors):
+                    loop.create_task(_async_send_log_error(bot, chat_id, item["module"], item["msg"], item["time"]))
+                _pending_log_errors.clear()
+
+def get_log_chat_id():
+    """Возвращает ID чата ubtg-logs."""
+    return log_chat_state.get("chat_id")
+
+def send_error_to_log_chat(module_name, msg):
+    """
+    Планирует отправку лога ошибки в чат ubtg-logs через Telegram бота.
+    Работает всегда, независимо от флага --debug.
+    """
+    chat_id = get_log_chat_id()
+    bot = get_bot()
+    now_str = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+
+    if not chat_id or not bot:
+        # Если чат логов еще не инициализирован, сохраняем в буфер
+        if len(_pending_log_errors) < 50:
+            _pending_log_errors.append({
+                "module": module_name,
+                "msg": str(msg),
+                "time": now_str
+            })
+        return
+
+    try:
+        loop = asyncio.get_event_loop()
+        if loop and loop.is_running():
+            loop.create_task(_async_send_log_error(bot, chat_id, module_name, msg, now_str))
+    except Exception:
+        pass
+
+async def _async_send_log_error(bot, chat_id, module_name, msg, time_str=None):
+    """Асинхронная отправка лога ошибки через Telegram бота в чат ubtg-logs."""
+    global _is_sending_log
+    if _is_sending_log:
+        return
+    try:
+        _is_sending_log = True
+        time_str = time_str or datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+        safe_msg = str(msg).strip()
+        if len(safe_msg) > 3500:
+            safe_msg = safe_msg[:3500] + "\n... [Лог обрезан по лимиту Telegram]"
+
+        text = (
+            f"🚨 **[ОШИБКА]** `[{module_name}]`\n"
+            f"⏱ **Время:** `{time_str}`\n\n"
+            f"**Детали ошибки:**\n"
+            f"```{safe_msg}```"
+        )
+        await bot.send_message(chat_id, text)
+    except Exception:
+        pass
+    finally:
+        _is_sending_log = False
+
+async def ensure_log_chat(userbot_client, bot_client, bot_username):
+    """
+    Проверяет существование чата ubtg-logs.
+    Если чат не найден, создает приватный канал 'ubtg-logs',
+    добавляет в него бота как администратора с правами публикации
+    и сохраняет log_chat_id в core_conf.json.
+    """
+    from telethon.tl.functions.channels import CreateChannelRequest, EditAdminRequest
+    from telethon.tl.types import ChatAdminRights
+    from telethon import utils
+
+    config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "core_conf.json")
+    config = {}
+    if os.path.exists(config_file):
+        try:
+            with open(config_file, "r", encoding="utf-8") as f:
+                config = json.load(f)
+        except Exception:
+            pass
+
+    saved_chat_id = config.get("log_chat_id")
+    target_channel = None
+
+    # 1. Проверяем сохраненный log_chat_id
+    if saved_chat_id:
+        try:
+            target_channel = await userbot_client.get_entity(saved_chat_id)
+        except Exception:
+            target_channel = None
+
+    # 2. Если не найден по сохраненному ID, ищем среди диалогов
+    if not target_channel:
+        try:
+            async for dialog in userbot_client.iter_dialogs(limit=100):
+                if dialog.is_channel and (dialog.name == "ubtg-logs" or dialog.title == "ubtg-logs"):
+                    target_channel = dialog.entity
+                    break
+        except Exception as e:
+            logger.debug(f"Поиск ubtg-logs в диалогах: {e}")
+
+    # 3. Если канал найден — проверяем/выдаем права боту
+    if target_channel:
+        channel_id = utils.get_peer_id(target_channel)
+        if bot_username:
+            try:
+                bot_user = await userbot_client.get_input_entity(bot_username)
+                admin_rights = ChatAdminRights(
+                    change_info=True,
+                    post_messages=True,
+                    edit_messages=True,
+                    delete_messages=True,
+                    invite_users=True
+                )
+                await userbot_client(EditAdminRequest(
+                    channel=target_channel,
+                    user_id=bot_user,
+                    admin_rights=admin_rights,
+                    rank="Logger Bot"
+                ))
+            except Exception as e:
+                logger.debug(f"Назначение прав боту в ubtg-logs: {e}")
+
+        set_log_chat_id(channel_id)
+        config["log_chat_id"] = channel_id
+        try:
+            with open(config_file, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=4, ensure_ascii=False)
+        except Exception:
+            pass
+        return channel_id
+
+    # 4. Если канала нет — создаем новый приватный канал ubtg-logs
+    logger.info("Создание приватного канала 'ubtg-logs' для логирования ошибок...")
+    result = await userbot_client(CreateChannelRequest(
+        title="ubtg-logs",
+        about="Логи ошибок юзербота UBTG",
+        megagroup=False
+    ))
+    target_channel = result.chats[0]
+    channel_id = utils.get_peer_id(target_channel)
+
+    # Добавляем бота как администратора
+    if bot_username:
+        try:
+            bot_user = await userbot_client.get_input_entity(bot_username)
+            admin_rights = ChatAdminRights(
+                change_info=True,
+                post_messages=True,
+                edit_messages=True,
+                delete_messages=True,
+                invite_users=True
+            )
+            await userbot_client(EditAdminRequest(
+                channel=target_channel,
+                user_id=bot_user,
+                admin_rights=admin_rights,
+                rank="Logger Bot"
+            ))
+        except Exception as e:
+            logger.debug(f"Назначение прав боту в новом ubtg-logs: {e}")
+
+    set_log_chat_id(channel_id)
+    config["log_chat_id"] = channel_id
+    try:
+        with open(config_file, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=4, ensure_ascii=False)
+    except Exception:
+        pass
+
+    # Отправляем приветственное сообщение в лог-чат от имени бота
+    try:
+        await bot_client.send_message(
+            channel_id,
+            "📁 **Чат логов UBTG (`ubtg-logs`) успешно создан!**\n\n"
+            "🤖 Сюда от имени бота будут автоматически присылаться все логи ошибок юзербота."
+        )
+    except Exception as ex_init_msg:
+        logger.debug(f"Ошибка отправки приветствия в ubtg-logs: {ex_init_msg}")
+
+    return channel_id
+
 class ModuleLogger:
-    """Логгер для модулей и ядра с поддержкой уровней, цветов и флага --debug."""
+    """Логгер для модулей и ядра с поддержкой уровней, цветов, флага --debug и отправки ошибок в чат."""
     def __init__(self, name="Core"):
         self.name = name
 
@@ -34,16 +233,22 @@ class ModuleLogger:
             self._log("DEBUG", "\033[36m", "🔍", msg)
 
     def info(self, msg):
-        self._log("INFO", "\033[32m", "ℹ️", msg)
+        if DEBUG_MODE:
+            self._log("INFO", "\033[32m", "ℹ️", msg)
 
     def warning(self, msg):
-        self._log("WARN", "\033[33m", "⚠️", msg)
+        if DEBUG_MODE:
+            self._log("WARN", "\033[33m", "⚠️", msg)
 
     def error(self, msg):
+        # Ошибки ВСЕГДА выводятся в консоль (и в debug режиме, и без него)
         self._log("ERROR", "\033[31m", "❌", msg)
+        # Ошибки ВСЕГДА отправляются в чат ubtg-logs через ТГ бота
+        send_error_to_log_chat(self.name, msg)
 
     def success(self, msg):
-        self._log("OK", "\033[32m", "✅", msg)
+        if DEBUG_MODE:
+            self._log("OK", "\033[32m", "✅", msg)
 
 def get_logger(module_name="Core"):
     """Возвращает экземпляр ModuleLogger для указанного модуля."""

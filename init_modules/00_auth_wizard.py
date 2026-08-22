@@ -3,6 +3,7 @@ import sys
 import json
 import time
 import re
+import socket
 import shutil
 import subprocess
 import threading
@@ -21,6 +22,8 @@ SETUP_URL_FILE = os.path.join(BASE_DIR, "setup_url.txt")
 ALL_LINK_FILES = (AUTH_LINK_FILE, AUTH_URL_FILE, WEB_URL_FILE, SETUP_URL_FILE)
 WEB_SETUP_HOST = "127.0.0.1"
 WEB_SETUP_TIMEOUT = 600
+DEFAULT_WEB_SETUP_PORT = 8080
+SET_WEB_PORT = None
 
 NO_API_SETUP = "--no-api" in sys.argv
 NO_PROXY_SETUP = "--no-proxy" in sys.argv
@@ -42,6 +45,11 @@ for index, arg in enumerate(sys.argv):
         SET_PROXY_PORT = sys.argv[index + 1]
     if arg == "--set-proxy-protocol" and index + 1 < len(sys.argv):
         SET_PROXY_PROTOCOL = sys.argv[index + 1]
+    if arg in ("--port", "-p", "--web-port", "--set-web-port", "--set-port") and index + 1 < len(sys.argv):
+        try:
+            SET_WEB_PORT = int(sys.argv[index + 1])
+        except ValueError:
+            print(f"[Init:Auth] ⚠️ Некорректный номер порта: {sys.argv[index + 1]}")
 
 
 def save_core_config(config_data):
@@ -732,41 +740,96 @@ class WebConfigRequestHandler(BaseHTTPRequestHandler):
         return
 
 
+def verify_server_running(host, port, thread, timeout=2.5):
+    """
+    Проверяет, что фоновый поток веб-сервера жив и сокет принимает входящие TCP соединения.
+    """
+    if not thread or not thread.is_alive():
+        return False
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not thread.is_alive():
+            return False
+        try:
+            with socket.create_connection((host, port), timeout=0.5):
+                return True
+        except (OSError, ConnectionRefusedError):
+            time.sleep(0.05)
+
+    return False
+
+
+def create_and_start_web_server(base_port=8080, max_attempts=100):
+    """
+    Создает и запускает ThreadingHTTPServer, начиная с base_port.
+    Если порт занят (OSError/EADDRINUSE), автоматически пробует следующий порт (+1 к номеру занятого порта).
+    Перед возвратом гарантирует, что сервер успешно запустился и отвечает на запросы.
+    """
+    start_port = base_port
+    for attempt in range(max_attempts):
+        port = start_port + attempt
+        try:
+            server = ThreadingHTTPServer((WEB_SETUP_HOST, port), WebConfigRequestHandler)
+            server.daemon_threads = True
+            server.config_received_event = threading.Event()
+            server.config_payload = None
+            
+            # Состояния UI страниц
+            server.show_qr_page = False
+            server.show_2fa_page = False
+            server.show_bot_setup_page = False
+            server.show_success_page = False
+            
+            # Состояния для QR и 2FA
+            server.qr_svg = None
+            server.qr_url = ""
+            server.qr_status = "Ожидаю настройки..."
+            server.password_event = threading.Event()
+            server.bot_setup_event = threading.Event()
+            server.password_2fa = None
+            server.error_msg = None
+
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+
+            actual_port = server.server_address[1]
+            if verify_server_running(WEB_SETUP_HOST, actual_port, thread):
+                if attempt > 0:
+                    print(f"[Init:Auth] 🌐 Веб-сервер успешно запущен на порту {actual_port} (после смещения на +{attempt})")
+                return server, thread
+            else:
+                try:
+                    server.shutdown()
+                    server.server_close()
+                except Exception:
+                    pass
+        except OSError as e:
+            print(f"[Init:Auth] ⚠️ Порт {port} занят ({e}). Пробую следующий порт {port + 1}...")
+            continue
+        except Exception as e:
+            print(f"[Init:Auth] ⚠️ Ошибка запуска на порту {port}: {e}. Пробую порт {port + 1}...")
+            continue
+
+    raise RuntimeError(f"Не удалось запустить веб-сервер после {max_attempts} попыток (порты {start_port}-{start_port + max_attempts - 1}).")
+
+
 def start_web_config_server():
-    """Запускает локальный веб-сервер для первичной настройки."""
+    """Запускает локальный веб-сервер для первичной настройки с авто-подбором порта."""
     global WEB_SETUP_SERVER
     if WEB_SETUP_SERVER is not None:
-        return WEB_SETUP_SERVER, None
+        if getattr(WEB_SETUP_SERVER, "server_address", None):
+            return WEB_SETUP_SERVER, None
 
-    server = ThreadingHTTPServer((WEB_SETUP_HOST, 0), WebConfigRequestHandler)
-    server.daemon_threads = True
-    server.config_received_event = threading.Event()
-    server.config_payload = None
-    
-    # Состояния UI страниц
-    server.show_qr_page = False
-    server.show_2fa_page = False
-    server.show_bot_setup_page = False
-    server.show_success_page = False
-    
-    # Состояния для QR и 2FA
-    server.qr_svg = None
-    server.qr_url = ""
-    server.qr_status = "Ожидаю настройки..."
-    server.password_event = threading.Event()
-    server.bot_setup_event = threading.Event()
-    server.password_2fa = None
-    server.error_msg = None
-
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    base_port = SET_WEB_PORT or DEFAULT_WEB_SETUP_PORT
+    server, thread = create_and_start_web_server(base_port=base_port)
     WEB_SETUP_SERVER = server
     return server, thread
 
 
 def dump_web_links(server, tunnel_url=None, path=""):
     """Сохраняет актуальные ссылки на веб-интерфейс в текстовые файлы."""
-    if not server:
+    if not server or not getattr(server, "server_address", None):
         return
     
     port = server.server_address[1]
@@ -803,10 +866,13 @@ def remove_auth_link():
 def ensure_web_setup_server():
     """Гарантирует, что веб-сервер для QR-страницы запущен и возвращает его."""
     global WEB_SETUP_SERVER
-    if WEB_SETUP_SERVER is not None:
+    if WEB_SETUP_SERVER is not None and getattr(WEB_SETUP_SERVER, "server_address", None):
         return WEB_SETUP_SERVER
 
     server, _ = start_web_config_server()
+    if not server or not getattr(server, "server_address", None):
+        raise RuntimeError("Не удалось запустить веб-сервер для QR-авторизации.")
+
     dump_web_links(server, path="/qr")
     print(f"🌐 Откройте страницу QR: http://{WEB_SETUP_HOST}:{server.server_address[1]}/qr")
     return server
@@ -814,8 +880,11 @@ def ensure_web_setup_server():
 
 def print_web_setup_links(server):
     """Печатает локальную и публичную ссылки для веб-настройки."""
-    print(f"🌐 Локальная веб-настройка: http://{WEB_SETUP_HOST}:{server.server_address[1]}/")
-    print(f"🌐 QR-страница: http://{WEB_SETUP_HOST}:{server.server_address[1]}/qr")
+    if not server or not getattr(server, "server_address", None):
+        return
+    port = server.server_address[1]
+    print(f"🌐 Локальная веб-настройка: http://{WEB_SETUP_HOST}:{port}/")
+    print(f"🌐 QR-страница: http://{WEB_SETUP_HOST}:{port}/qr")
 
 
 def update_qr_ui(url, status_text):
@@ -949,11 +1018,17 @@ def stop_localtunnel(process):
 def wait_for_web_config():
     """Ожидает, пока пользователь сохранит настройки через веб-форму."""
     server, _ = start_web_config_server()
+    if not server or not getattr(server, "server_address", None):
+        raise RuntimeError("Не удалось запустить веб-сервер для первоначальной настройки.")
+
+    actual_port = server.server_address[1]
+
+    # 1. Генерируем локальные ссылки
     dump_web_links(server, path="/")
     tunnel_process = None
     tunnel_url = None
     try:
-        tunnel_process, tunnel_url = start_localtunnel(server.server_address[1])
+        tunnel_process, tunnel_url = start_localtunnel(actual_port)
         if tunnel_url:
             dump_web_links(server, tunnel_url=tunnel_url, path="/")
     except Exception as e:
@@ -970,7 +1045,7 @@ def wait_for_web_config():
         print("ℹ️ localtunnel недоступен или не успел подняться; используется только локальный адрес.")
     print(f"📁 Ссылка для веб-настройки сохранена в файл: {AUTH_LINK_FILE}")
     print("Ожидаю сохранения настроек...")
-    print("\n💡 Для перехода к QR-коду откройте: http://127.0.0.1:" + str(server.server_address[1]) + "/qr")
+    print(f"\n💡 Для перехода к QR-коду откройте: http://{WEB_SETUP_HOST}:{actual_port}/qr")
 
     try:
         if server.config_received_event.wait(WEB_SETUP_TIMEOUT):
@@ -987,11 +1062,15 @@ def wait_for_web_config():
 def setup_qr_web_ui():
     """Создает и настраивает веб-интерфейс для QR кода."""
     server = ensure_web_setup_server()
+    if not server or not getattr(server, "server_address", None):
+        raise RuntimeError("Не удалось запустить веб-сервер для QR-кода.")
+
+    actual_port = server.server_address[1]
     dump_web_links(server, path="/qr")
     tunnel_process = None
     tunnel_url = None
     try:
-        tunnel_process, tunnel_url = start_localtunnel(server.server_address[1])
+        tunnel_process, tunnel_url = start_localtunnel(actual_port)
         if tunnel_url:
             dump_web_links(server, tunnel_url=tunnel_url, path="/qr")
             print(f"🌍 Публичная ссылка для QR: {tunnel_url}/qr")

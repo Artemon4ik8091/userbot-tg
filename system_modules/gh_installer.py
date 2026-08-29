@@ -26,12 +26,28 @@ logger = get_logger("GHInstaller")
 # Метаданные системного модуля
 set_module_meta(
     name="Package Manager",
-    desc="Установка модулей из репозитория GitHub, поиск с фото и кнопками, обновление и удаление.",
+    desc="Установка модулей из репозитория GitHub/Gitea, поиск с фото и кнопками, обновление и удаление.",
     system=True
 )
 
-# 🔗 Ссылка на индекс репозитория
-INDEX_URL = "https://raw.githubusercontent.com/Artemon4ik8091/ubtg-repo/refs/heads/main/index.json"
+# 🔗 Ссылки на репозитории (Основной: GitHub, Fallback: Gitea)
+REPO_SOURCES = [
+    {
+        "name": "GitHub",
+        "index_url": "https://raw.githubusercontent.com/Artemon4ik8091/ubtg-repo/refs/heads/main/index.json",
+        "raw_base_url": "https://raw.githubusercontent.com/Artemon4ik8091/ubtg-repo/refs/heads/main/",
+        "web_base_url": "https://github.com/Artemon4ik8091/ubtg-repo/blob/main/"
+    },
+    {
+        "name": "Gitea",
+        "index_url": "https://gitea.com/aswer/ubtg-repo/raw/branch/main/index.json",
+        "raw_base_url": "https://gitea.com/aswer/ubtg-repo/raw/branch/main/",
+        "web_base_url": "https://gitea.com/aswer/ubtg-repo/src/branch/main/"
+    }
+]
+
+# Для обратной совместимости
+INDEX_URL = REPO_SOURCES[0]["index_url"]
 
 # --- НАСТРОЙКИ КЭША И СЕССИЙ ---
 CACHE_TIMEOUT = 3600  # 1 час кэша
@@ -90,7 +106,8 @@ async def pip_install(package_name):
 
 async def fetch_repo_index(force=False):
     """
-    Скачивает и парсит index.json строго из репозитория с кэшированием.
+    Скачивает и парсит index.json из репозитория с кэшированием.
+    Сначала опрашивает GitHub, а при неудаче обращается к зеркалу Gitea.
     """
     global _repo_cache, _last_repo_update
     
@@ -99,19 +116,29 @@ async def fetch_repo_index(force=False):
         if current_time - _last_repo_update < CACHE_TIMEOUT:
             return _repo_cache, ""
             
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(INDEX_URL, timeout=10) as resp:
-                if resp.status == 200:
-                    text_data = await resp.text()
-                    _repo_cache = json.loads(text_data)
-                    _last_repo_update = current_time
-                    return _repo_cache, ""
-                else:
-                    if _repo_cache is not None:
-                        return _repo_cache, f"GitHub вернул статус {resp.status} (использован кэш)"
-    except Exception as e:
-        logger.warning(f"Ошибка загрузки индекса из сети: {e}")
+    last_err = ""
+    async with aiohttp.ClientSession() as session:
+        for repo in REPO_SOURCES:
+            name = repo["name"]
+            url = repo["index_url"]
+            try:
+                async with session.get(url, timeout=10) as resp:
+                    if resp.status == 200:
+                        text_data = await resp.text()
+                        _repo_cache = json.loads(text_data)
+                        _last_repo_update = current_time
+                        logger.info(f"Индекс успешно загружен из {name} ({url})")
+                        return _repo_cache, ""
+                    else:
+                        last_err = f"{name} вернул HTTP {resp.status}"
+                        logger.warning(f"Ошибка загрузки индекса из {name} ({url}): HTTP {resp.status}")
+            except Exception as e:
+                last_err = f"Ошибка сети при запросе к {name}: {e}"
+                logger.warning(f"Не удалось получить индекс из {name} ({url}): {e}")
+
+    # Fallback: сохраненный кэш в памяти
+    if _repo_cache is not None:
+        return _repo_cache, f"Использован сохраненный кэш ({last_err})"
 
     # Fallback: проверка локального файла index.json репозитория при сетевой ошибке
     local_index_candidates = [
@@ -128,10 +155,65 @@ async def fetch_repo_index(force=False):
             except Exception:
                 pass
 
-    if _repo_cache is not None:
-        return _repo_cache, "Использован сохраненный кэш репозитория"
+    return None, f"Не удалось получить index.json из репозиториев (GitHub/Gitea). {last_err}"
 
-    return None, "Не удалось получить index.json из репозитория"
+
+def get_candidate_download_urls(path_or_url):
+    """
+    Возвращает список пар (source_name, url) для скачивания файла:
+    сначала GitHub, затем Gitea.
+    """
+    urls = []
+    rel_path = path_or_url
+    for repo in REPO_SOURCES:
+        raw_base = repo["raw_base_url"]
+        if rel_path.startswith(raw_base):
+            rel_path = rel_path[len(raw_base):]
+            break
+        for prefix in [
+            "https://raw.githubusercontent.com/Artemon4ik8091/ubtg-repo/refs/heads/main/",
+            "https://raw.githubusercontent.com/Artemon4ik8091/ubtg-repo/main/",
+            "https://github.com/Artemon4ik8091/ubtg-repo/raw/main/",
+            "https://gitea.com/aswer/ubtg-repo/raw/branch/main/"
+        ]:
+            if rel_path.startswith(prefix):
+                rel_path = rel_path[len(prefix):]
+                break
+
+    if not rel_path.startswith("http://") and not rel_path.startswith("https://"):
+        rel_clean = rel_path.lstrip('/')
+        for repo in REPO_SOURCES:
+            urls.append((repo["name"], repo["raw_base_url"] + rel_clean))
+    else:
+        urls.append(("Direct", path_or_url))
+        
+    return urls
+
+
+async def download_module_file(path_or_url, timeout=20):
+    """
+    Скачивает файл модуля, проверяя сначала GitHub, а при ошибке - Gitea.
+    Возвращает кортеж: (content: str | None, error_msg: str, source_name: str)
+    """
+    candidates = get_candidate_download_urls(path_or_url)
+    last_error = ""
+    
+    async with aiohttp.ClientSession() as session:
+        for source_name, url in candidates:
+            try:
+                async with session.get(url, timeout=timeout) as resp:
+                    if resp.status == 200:
+                        content = await resp.text()
+                        logger.info(f"Файл успешно скачан из {source_name}: {url}")
+                        return content, "", source_name
+                    else:
+                        last_error = f"{source_name} вернул HTTP {resp.status}"
+                        logger.warning(f"Ошибка скачивания из {source_name} ({url}): HTTP {resp.status}")
+            except Exception as e:
+                last_error = f"{source_name} ({type(e).__name__}: {e})"
+                logger.warning(f"Ошибка соединения с {source_name} ({url}): {e}")
+
+    return None, f"Не удалось скачать файл ни с GitHub, ни с Gitea. ({last_error})", ""
 
 
 def normalize_module_info(alias, raw_val, base_url=None):
@@ -139,7 +221,7 @@ def normalize_module_info(alias, raw_val, base_url=None):
     Нормализует данные о модуле строго из полученного index.json.
     Если каких-то параметров нет в индексе, они остаются пустыми / дефолтными.
     """
-    base_url = base_url or (INDEX_URL.rsplit('/', 1)[0] + '/')
+    base_url = base_url or (REPO_SOURCES[0]["raw_base_url"])
     
     if isinstance(raw_val, str):
         path = raw_val
@@ -171,8 +253,14 @@ def normalize_module_info(alias, raw_val, base_url=None):
     if image and not (image.startswith("http://") or image.startswith("https://")):
         image = base_url + image.lstrip('/')
 
-    file_name = file_url.split('/')[-1]
+    file_name = file_url.split('/')[-1].split('?')[0]
     module_name = file_name[:-3] if file_name.endswith(".py") else file_name
+
+    # Ссылка на исходник в веб-интерфейсе GitHub
+    if not (path.startswith("http://") or path.startswith("https://")):
+        web_url = REPO_SOURCES[0]["web_base_url"] + path.lstrip('/')
+    else:
+        web_url = file_url
 
     return {
         "alias": alias,
@@ -181,6 +269,7 @@ def normalize_module_info(alias, raw_val, base_url=None):
         "image": image,
         "path": path,
         "file_url": file_url,
+        "web_url": web_url,
         "file_name": file_name,
         "module_name": module_name,
         "commands": commands,
@@ -269,10 +358,11 @@ def build_card_view(session_id, index=0):
     else:
         buttons.append([action_btn])
 
-    # Ряд 3: Исходный код на GitHub и закрытие
+    # Ряд 3: Исходный код и закрытие
     row3 = []
-    if mod.get("file_url"):
-        row3.append(Button.url("🔗 Исходник", mod["file_url"]))
+    src_link = mod.get("web_url") or mod.get("file_url")
+    if src_link:
+        row3.append(Button.url("🔗 Исходник", src_link))
     row3.append(Button.inline("❌ Закрыть", f"gh_close:{session_id}".encode()))
     buttons.append(row3)
 
@@ -359,21 +449,25 @@ async def perform_module_install(client, chat_id, message_id, package_alias, eve
             return await update_status(f"❌ **Ошибка доступа к репозиторию!**\n`{err}`")
 
         if package_alias not in repo_index:
-            avail = ", ".join([f"`{k}`" for k in repo_index.keys()])
-            return await update_status(f"❌ Пакет `{package_alias}` не найден в репозитории.\n📦 **Доступные модули:**\n{avail}")
+            # Принудительно пробуем обновить индекс со всех источников (вдруг добавлен недавно в GitHub или Gitea)
+            repo_index, err = await fetch_repo_index(force=True)
+
+        if not repo_index or package_alias not in repo_index:
+            avail = ", ".join([f"`{k}`" for k in repo_index.keys()]) if repo_index else "нет"
+            return await update_status(f"❌ Пакет `{package_alias}` не найден в репозиториях (GitHub/Gitea).\n📦 **Доступные модули:**\n{avail}")
 
         mod = normalize_module_info(package_alias, repo_index[package_alias])
-        file_url = mod["file_url"]
         file_name = mod["file_name"]
         module_name = mod["module_name"]
+        path = mod.get("path") or mod["file_url"]
 
         await update_status(f"⏳ `Скачиваю {file_name}...`")
 
-        async with aiohttp.ClientSession() as session:
-            async with session.get(file_url, timeout=20) as resp:
-                if resp.status != 200:
-                    return await update_status(f"❌ Ошибка скачивания `{file_name}`! HTTP статус: {resp.status}")
-                code = await resp.text()
+        code, dl_err, source_used = await download_module_file(path)
+        if code is None:
+            return await update_status(f"❌ **Ошибка скачивания `{file_name}`!**\n{dl_err}")
+
+        logger.info(f"Модуль {package_alias} успешно скачан из {source_used}")
 
         modules_dir = get_modules_dir()
         if modules_dir not in sys.path:
@@ -535,7 +629,7 @@ async def search_module_cmd(client, event, args):
     _clean_old_sessions()
     query = args.strip().lower() if args else "all"
 
-    await event.edit(f"🔍 `Ищу '{query}' в репозитории GitHub...`")
+    await event.edit(f"🔍 `Ищу '{query}' в репозитории...`")
     repo_index, err = await fetch_repo_index()
 
     if repo_index is None:
@@ -598,7 +692,7 @@ async def install_module_cmd(client, event, args):
     await perform_module_install(client, event.chat_id, event.id, package_alias, event=event)
 
 
-@register_cmd("updaterepo", desc="Принудительно обновить список модулей из репозитория GitHub")
+@register_cmd("updaterepo", desc="Принудительно обновить список модулей из репозитория (GitHub/Gitea)")
 async def update_repo_cmd(client, event, args):
     """Принудительно обновляет локальный кэш index.json."""
     await event.edit("🔄 `Скачиваю свежий индекс репозитория...`")
@@ -615,7 +709,7 @@ async def update_repo_cmd(client, event, args):
     await event.edit(msg)
 
 
-@register_cmd("upgrade", desc="Обновить индекс и все установленные модули из репозитория")
+@register_cmd("upgrade", desc="Обновить индекс и все установленные модули из репозитория (GitHub/Gitea)")
 async def upgrade_cmd(client, event, args):
     """Обновляет все локально установленные модули до последних версий из репозитория."""
     await event.edit("🔄 `Обновляю индекс репозитория...`")
@@ -635,39 +729,37 @@ async def upgrade_cmd(client, event, args):
     for alias, raw_val in repo_index.items():
         mod = normalize_module_info(alias, raw_val)
         file_name = mod["file_name"]
-        file_url = mod["file_url"]
         file_path = os.path.join(modules_dir, file_name)
+        path = mod.get("path") or mod["file_url"]
         
         if os.path.exists(file_path):
             try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(file_url, timeout=20) as resp:
-                        if resp.status == 200:
-                            code = await resp.text()
-                            with open(file_path, "w", encoding="utf-8") as f:
-                                f.write(code)
-                            
-                            importlib.invalidate_caches()
-                            module_name = mod["module_name"]
-                            try:
-                                if module_name in sys.modules:
-                                    importlib.reload(sys.modules[module_name])
-                                else:
-                                    importlib.import_module(module_name)
-                                upgraded.append(alias)
-                            except ModuleNotFoundError as err_mod:
-                                if err_mod.name and err_mod.name != module_name and err_mod.name != alias:
-                                    await pip_install(err_mod.name)
-                                    importlib.invalidate_caches()
-                                    if module_name in sys.modules:
-                                        importlib.reload(sys.modules[module_name])
-                                    else:
-                                        importlib.import_module(module_name)
-                                    upgraded.append(alias)
-                                else:
-                                    errors_list.append(f"{alias} ({err_mod})")
+                code, dl_err, source_used = await download_module_file(path)
+                if code is not None:
+                    with open(file_path, "w", encoding="utf-8") as f:
+                        f.write(code)
+                    
+                    importlib.invalidate_caches()
+                    module_name = mod["module_name"]
+                    try:
+                        if module_name in sys.modules:
+                            importlib.reload(sys.modules[module_name])
                         else:
-                            errors_list.append(f"{alias} (HTTP {resp.status})")
+                            importlib.import_module(module_name)
+                        upgraded.append(alias)
+                    except ModuleNotFoundError as err_mod:
+                        if err_mod.name and err_mod.name != module_name and err_mod.name != alias:
+                            await pip_install(err_mod.name)
+                            importlib.invalidate_caches()
+                            if module_name in sys.modules:
+                                importlib.reload(sys.modules[module_name])
+                            else:
+                                importlib.import_module(module_name)
+                            upgraded.append(alias)
+                        else:
+                            errors_list.append(f"{alias} ({err_mod})")
+                else:
+                    errors_list.append(f"{alias} ({dl_err})")
             except Exception as e:
                 errors_list.append(f"{alias} ({type(e).__name__})")
     

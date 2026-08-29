@@ -27,23 +27,23 @@ logger = get_logger("GHInstaller")
 # Метаданные системного модуля
 set_module_meta(
     name="Package Manager",
-    desc="Установка модулей из репозитория GitHub/Gitea, поиск с фото и кнопками, обновление и удаление.",
+    desc="Установка модулей из репозитория Gitea/GitHub, поиск с фото и кнопками, обновление и удаление.",
     system=True
 )
 
-# 🔗 Ссылки на репозитории (Основной: GitHub, Fallback: Gitea)
+# 🔗 Ссылки на репозитории (Основной: Gitea, Fallback: GitHub)
 REPO_SOURCES = [
-    {
-        "name": "GitHub",
-        "index_url": "https://raw.githubusercontent.com/Artemon4ik8091/ubtg-repo/refs/heads/main/index.json",
-        "raw_base_url": "https://raw.githubusercontent.com/Artemon4ik8091/ubtg-repo/refs/heads/main/",
-        "web_base_url": "https://github.com/Artemon4ik8091/ubtg-repo/blob/main/"
-    },
     {
         "name": "Gitea",
         "index_url": "https://gitea.com/aswer/ubtg-repo/raw/branch/main/index.json",
         "raw_base_url": "https://gitea.com/aswer/ubtg-repo/raw/branch/main/",
         "web_base_url": "https://gitea.com/aswer/ubtg-repo/src/branch/main/"
+    },
+    {
+        "name": "GitHub",
+        "index_url": "https://raw.githubusercontent.com/Artemon4ik8091/ubtg-repo/refs/heads/main/index.json",
+        "raw_base_url": "https://raw.githubusercontent.com/Artemon4ik8091/ubtg-repo/refs/heads/main/",
+        "web_base_url": "https://github.com/Artemon4ik8091/ubtg-repo/blob/main/"
     }
 ]
 
@@ -140,7 +140,7 @@ async def pip_install(package_name):
 async def fetch_repo_index(force=False):
     """
     Скачивает и парсит index.json из репозитория с кэшированием.
-    Сначала опрашивает GitHub, а при неудаче обращается к зеркалу Gitea.
+    Сначала опрашивает Gitea, а при неудаче обращается к зеркалу GitHub.
     """
     global _repo_cache, _last_repo_update
     
@@ -188,13 +188,13 @@ async def fetch_repo_index(force=False):
             except Exception:
                 pass
 
-    return None, f"Не удалось получить index.json из репозиториев (GitHub/Gitea). {last_err}"
+    return None, f"Не удалось получить index.json из репозиториев (Gitea/GitHub). {last_err}"
 
 
 def get_candidate_download_urls(path_or_url):
     """
     Возвращает список пар (source_name, url) для скачивания файла:
-    сначала GitHub, затем Gitea.
+    сначала Gitea, затем GitHub.
     """
     urls = []
     rel_path = path_or_url
@@ -204,10 +204,10 @@ def get_candidate_download_urls(path_or_url):
             rel_path = rel_path[len(raw_base):]
             break
         for prefix in [
+            "https://gitea.com/aswer/ubtg-repo/raw/branch/main/",
             "https://raw.githubusercontent.com/Artemon4ik8091/ubtg-repo/refs/heads/main/",
             "https://raw.githubusercontent.com/Artemon4ik8091/ubtg-repo/main/",
-            "https://github.com/Artemon4ik8091/ubtg-repo/raw/main/",
-            "https://gitea.com/aswer/ubtg-repo/raw/branch/main/"
+            "https://github.com/Artemon4ik8091/ubtg-repo/raw/main/"
         ]:
             if rel_path.startswith(prefix):
                 rel_path = rel_path[len(prefix):]
@@ -225,7 +225,7 @@ def get_candidate_download_urls(path_or_url):
 
 async def download_module_file(path_or_url, timeout=20):
     """
-    Скачивает файл модуля, проверяя сначала GitHub, а при ошибке - Gitea.
+    Скачивает файл модуля, проверяя сначала Gitea, а при ошибке - GitHub.
     Возвращает кортеж: (content: str | None, error_msg: str, source_name: str)
     """
     candidates = get_candidate_download_urls(path_or_url)
@@ -246,7 +246,7 @@ async def download_module_file(path_or_url, timeout=20):
                 last_error = f"{source_name} ({type(e).__name__}: {e})"
                 logger.warning(f"Ошибка соединения с {source_name} ({url}): {e}")
 
-    return None, f"Не удалось скачать файл ни с GitHub, ни с Gitea. ({last_error})", ""
+    return None, f"Не удалось скачать файл ни с Gitea, ни с GitHub. ({last_error})", ""
 
 
 async def get_remote_module_content(path, timeout=15):
@@ -547,12 +547,12 @@ async def perform_module_install(client, chat_id, message_id, package_alias, eve
             return await update_status(f"❌ **Ошибка доступа к репозиторию!**\n`{err}`")
 
         if package_alias not in repo_index:
-            # Принудительно пробуем обновить индекс со всех источников (вдруг добавлен недавно в GitHub или Gitea)
+            # Принудительно пробуем обновить индекс со всех источников (вдруг добавлен недавно в Gitea или GitHub)
             repo_index, err = await fetch_repo_index(force=True)
 
         if not repo_index or package_alias not in repo_index:
             avail = ", ".join([f"`{k}`" for k in repo_index.keys()]) if repo_index else "нет"
-            return await update_status(f"❌ Пакет `{package_alias}` не найден в репозиториях (GitHub/Gitea).\n📦 **Доступные модули:**\n{avail}")
+            return await update_status(f"❌ Пакет `{package_alias}` не найден в репозиториях (Gitea/GitHub).\n📦 **Доступные модули:**\n{avail}")
 
         mod = normalize_module_info(package_alias, repo_index[package_alias])
         file_name = mod["file_name"]
@@ -1139,7 +1139,7 @@ async def upgrade_cmd(client, event, args):
     await perform_bulk_upgrade(client, event.chat_id, event.id, force_all=force, target_alias=target, event=event)
 
 
-@register_cmd("updaterepo", desc="Принудительно обновить список модулей из репозитория (GitHub/Gitea)")
+@register_cmd("updaterepo", desc="Принудительно обновить список модулей из репозитория (Gitea/GitHub)")
 async def update_repo_cmd(client, event, args):
     """Принудительно обновляет локальный кэш index.json."""
     await event.edit("🔄 `Скачиваю свежий индекс репозитория...`")

@@ -8,7 +8,8 @@ from registry import init_config, get_config, set_module_meta, register_cmd
 # Задаем мета-инфу
 set_module_meta("Info", "Показывает красивую инфу о юзерботе и системе", system=True)
 
-REPO_URL = "https://github.com/Artemon4ik8091/userbot-tg"
+REPO_URL = "https://gitea.com/aswer/userbot-tg"
+GITHUB_REPO_URL = "https://github.com/Artemon4ik8091/userbot-tg"
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -153,7 +154,7 @@ async def cmd_info(client, event, args):
     # Хардкодный текст, который не меняется через конфиг (твой копирайт)
     hardcoded_text = (
         f"\n\n**🤖 UBTG Userbot | by aswer**\n"
-        f"🔗 [GitHub Репозиторий]({REPO_URL})"
+        f"🔗 [Gitea Репозиторий]({REPO_URL}) | [GitHub]({GITHUB_REPO_URL})"
     )
 
     # Склеиваем

@@ -25,7 +25,7 @@ logger = get_logger("Update")
 # Системный модуль обновления юзербота (удалять нельзя)
 set_module_meta(
     name="Обновление",
-    desc="Системный модуль обновления юзербота из официального GitHub репозитория с инлайн-кнопками и фоновым чекером.",
+    desc="Системный модуль обновления юзербота из репозитория GitHub/Gitea с инлайн-кнопками и фоновым чекером.",
     system=True
 )
 
@@ -35,6 +35,19 @@ init_config("module_update", {
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OFFICIAL_REPO_URL = "https://github.com/Artemon4ik8091/userbot-tg"
+GITEA_REPO_URL = "https://gitea.com/aswer/userbot-tg"
+
+# 🔗 Ссылки на репозитории (Основной: GitHub, Fallback: Gitea)
+REPO_SOURCES = [
+    {
+        "name": "GitHub",
+        "url": OFFICIAL_REPO_URL
+    },
+    {
+        "name": "Gitea",
+        "url": GITEA_REPO_URL
+    }
+]
 
 
 async def run_git_cmd(*args, timeout=45):
@@ -122,7 +135,7 @@ def is_git_repo():
 
 async def ensure_git_setup():
     """
-    Проверяет готовность git и гарантирует привязку origin к официальному репозиторию.
+    Проверяет готовность git и гарантирует привязку origin к репозиторию.
     Возвращает (success: bool, error_message: str).
     """
     if not is_git_installed():
@@ -142,10 +155,31 @@ async def ensure_git_setup():
         if "origin" not in remotes.split():
             logger.debug(f"Добавляю origin: {OFFICIAL_REPO_URL}")
             await run_git_cmd("remote", "add", "origin", OFFICIAL_REPO_URL)
-        else:
-            await run_git_cmd("remote", "set-url", "origin", OFFICIAL_REPO_URL)
 
     return True, ""
+
+
+async def git_fetch_with_fallback(branch, timeout=30):
+    """
+    Выполняет git fetch с проверкой сначала GitHub, а при ошибке - Gitea.
+    Автоматически переключает URL origin на рабочий репозиторий.
+    Возвращает (success: bool, source_name: str, error_message: str).
+    """
+    errors = []
+    for source in REPO_SOURCES:
+        name = source["name"]
+        url = source["url"]
+        logger.debug(f"Попытка git fetch из {name} ({url})...")
+        await run_git_cmd("remote", "set-url", "origin", url)
+        code, _, fetch_err = await run_git_cmd("fetch", "origin", branch, timeout=timeout)
+        if code == 0:
+            logger.info(f"git fetch успешно выполнен из {name}")
+            return True, name, ""
+        else:
+            logger.warning(f"Ошибка при git fetch из {name}: {fetch_err}")
+            errors.append(f"{name}: {fetch_err}")
+
+    return False, "", " | ".join(errors)
 
 
 async def get_current_branch():
@@ -178,6 +212,7 @@ async def get_commit_info(revision="HEAD"):
 async def check_updates_state():
     """
     Выполняет проверку обновлений через fetch и сравнение HEAD с origin/branch.
+    Сначала проверяет GitHub, при сбое - Gitea.
     Возвращает словарь с результатами проверки.
     """
     logger.debug("Запуск проверки наличия обновлений...")
@@ -186,11 +221,11 @@ async def check_updates_state():
         return {"ok": False, "error": err}
 
     branch = await get_current_branch()
-    logger.debug(f"Текущая ветка: {branch}. Выполняю git fetch...")
-    code, _, fetch_err = await run_git_cmd("fetch", "origin", branch, timeout=30)
-    if code != 0:
+    logger.debug(f"Текущая ветка: {branch}. Выполняю git fetch с поддержкой fallback...")
+    fetch_ok, source_name, fetch_err = await git_fetch_with_fallback(branch, timeout=30)
+    if not fetch_ok:
         logger.error(f"Ошибка при git fetch: {fetch_err}")
-        return {"ok": False, "error": f"Не удалось связаться с GitHub (`git fetch`):\n`{fetch_err}`"}
+        return {"ok": False, "error": f"Не удалось связаться с репозиториями (GitHub / Gitea):\n`{fetch_err}`"}
 
     code_behind, behind_count_str, _ = await run_git_cmd("rev-list", "--count", f"HEAD..origin/{branch}")
     behind_count = int(behind_count_str) if (code_behind == 0 and behind_count_str.isdigit()) else 0
@@ -199,7 +234,7 @@ async def check_updates_state():
     ahead_count = int(ahead_count_str) if (code_ahead == 0 and ahead_count_str.isdigit()) else 0
 
     current_commit = await get_commit_info("HEAD")
-    logger.debug(f"Состояние: behind={behind_count}, ahead={ahead_count}, commit={current_commit.get('short_hash') if current_commit else 'None'}")
+    logger.debug(f"Состояние [{source_name}]: behind={behind_count}, ahead={ahead_count}, commit={current_commit.get('short_hash') if current_commit else 'None'}")
 
     new_commits_log = ""
     if behind_count > 0:
@@ -216,6 +251,7 @@ async def check_updates_state():
     return {
         "ok": True,
         "branch": branch,
+        "source_name": source_name,
         "behind_count": behind_count,
         "ahead_count": ahead_count,
         "current_commit": current_commit,
@@ -232,11 +268,14 @@ def build_update_ui(state):
     ahead_count = state.get("ahead_count", 0)
     current_commit = state.get("current_commit")
     new_commits_log = state.get("new_commits_log", "")
+    source_name = state.get("source_name", "GitHub")
 
     cur_hash_str = f"`{current_commit['short_hash']}`" if current_commit else "Н/Д"
     cur_msg_str = current_commit['message'] if current_commit else ""
     cur_author_str = current_commit['author'] if current_commit else "Неизвестен"
     cur_date_str = current_commit['date'] if current_commit else ""
+
+    src_badge = f" *(Источник: {source_name})*" if source_name != "GitHub" else ""
 
     if behind_count > 0:
         commits_display = new_commits_log or "• Новые изменения в репозитории"
@@ -244,7 +283,7 @@ def build_update_ui(state):
             commits_display += f"\n*...и еще {behind_count - 10} коммитов*"
 
         text = (
-            f"📦 **Доступно обновление UBTG!**\n\n"
+            f"📦 **Доступно обновление UBTG!**{src_badge}\n\n"
             f"🌿 **Ветка:** `{branch}`\n"
             f"🔢 **Новых коммитов:** `{behind_count}`\n\n"
             f"📋 **Список изменений:**\n"
@@ -261,12 +300,12 @@ def build_update_ui(state):
 
     elif ahead_count > 0:
         text = (
-            f"ℹ️ **Локальная версия опережает репозиторий**\n\n"
+            f"ℹ️ **Локальная версия опережает репозиторий**{src_badge}\n\n"
             f"🌿 **Ветка:** `{branch}`\n"
             f"🔢 **Локальных коммитов:** `{ahead_count}`\n"
             f"📌 **Текущий коммит:** {cur_hash_str} — {cur_msg_str}\n"
             f"👤 **Автор:** `{cur_author_str}` ({cur_date_str})\n\n"
-            f"💡 Для синхронизации с GitHub можно использовать `.update force`."
+            f"💡 Для синхронизации с репозиторием можно использовать `.update force`."
         )
         buttons = [
             [
@@ -278,12 +317,12 @@ def build_update_ui(state):
 
     else:
         text = (
-            f"✅ **Юзербот обновлен до последней версии!**\n\n"
+            f"✅ **Юзербот обновлен до последней версии!**{src_badge}\n\n"
             f"🌿 **Ветка:** `{branch}`\n"
             f"📌 **Текущий коммит:** {cur_hash_str}\n"
             f"💬 `{cur_msg_str}`\n"
             f"👤 **Автор:** `{cur_author_str}` ({cur_date_str})\n\n"
-            f"🔗 [GitHub Репозиторий]({OFFICIAL_REPO_URL})"
+            f"🔗 [GitHub]({OFFICIAL_REPO_URL}) | [Gitea]({GITEA_REPO_URL})"
         )
         buttons = [
             [Button.inline("🔄 Попробовать снова", b"upd_recheck")]
@@ -330,14 +369,16 @@ async def run_update_sequence(client, chat_id, message_id, branch, force=False, 
         await edit_any_message(target_client, chat_id, message_id, msg_text, buttons=None)
 
     try:
-        await update_status("⏳ **Проверяю и скачиваю обновление из GitHub...**")
+        await update_status("⏳ **Проверяю и скачиваю обновление...**")
 
-        # 1. Fetch
-        logger.debug(f"Выполняю git fetch origin {branch}...")
-        code, _, fetch_err = await run_git_cmd("fetch", "origin", branch)
-        if code != 0:
-            logger.error(f"git fetch origin {branch} завершился с ошибкой: {fetch_err}")
-            return await update_status(f"❌ Ошибка подключения к GitHub (`git fetch`):\n`{fetch_err}`")
+        # 1. Fetch с fallback
+        logger.debug(f"Выполняю git fetch для ветки {branch}...")
+        fetch_ok, source_name, fetch_err = await git_fetch_with_fallback(branch, timeout=45)
+        if not fetch_ok:
+            logger.error(f"git fetch завершился с ошибкой: {fetch_err}")
+            return await update_status(f"❌ Ошибка подключения к репозиториям (`git fetch`):\n`{fetch_err}`")
+
+        logger.info(f"Обновление скачивается из источника: {source_name}")
 
         # 2. Pull или Reset (в зависимости от режима force)
         if force:
@@ -356,7 +397,7 @@ async def run_update_sequence(client, chat_id, message_id, branch, force=False, 
                 if "conflict" in (pull_err + pull_out).lower() or "local changes" in (pull_err + pull_out).lower():
                     conflict_hint = (
                         "\n\n💡 **Обнаружен конфликт с локальными файлами!**\n"
-                        "Используйте `.update force`, чтобы перезаписать локальные изменения версией из GitHub."
+                        "Используйте `.update force`, чтобы перезаписать локальные изменения версией из репозитория."
                     )
                 return await update_status(f"❌ **Ошибка при выполнении git pull:**\n`{pull_err or pull_out}`{conflict_hint}")
 
@@ -378,7 +419,8 @@ async def run_update_sequence(client, chat_id, message_id, branch, force=False, 
             f"🎉 **Юзербот успешно обновлен{' (force)' if force else ''} и перезапущен!**\n\n"
             f"🌿 **Ветка:** `{branch}`\n"
             f"📌 **Коммит:** {commit_badge}\n"
-            f"👤 **Автор:** `{new_commit['author'] if new_commit else 'GitHub'}`"
+            f"🌐 **Источник:** `{source_name}`\n"
+            f"👤 **Автор:** `{new_commit['author'] if new_commit else 'UBTG Team'}`"
         )
 
         logger.info("Подготовка к перезагрузке юзербота...")
@@ -448,7 +490,7 @@ async def cb_upd_recheck(event, data):
     logger.info(f"Повторная проверка обновлений пользователем {sender.id}")
     await event.answer("🔄 Проверяю обновления...")
     try:
-        await event.edit("🔄 `Проверяю наличие обновлений на GitHub...`", buttons=None)
+        await event.edit("🔄 `Проверяю наличие обновлений...`", buttons=None)
     except errors.MessageNotModifiedError:
         pass
 
@@ -522,7 +564,7 @@ async def cb_bot_upd_snooze(event, data):
 @register_bg()
 async def auto_update_checker(client):
     """
-    Фоновый процесс: каждые 15 минут проверяет наличие обновлений в репозитории.
+    Фоновый процесс: каждые 15 минут проверяет наличие обновлений в репозитории (GitHub / Gitea).
     При обнаружении отправляет сообщение владельцу от имени встроенного бота с кнопками.
     """
     logger.debug("Запуск фонового чекера авто-обновлений...")
@@ -535,8 +577,8 @@ async def auto_update_checker(client):
             ready, _ = await ensure_git_setup()
             if ready:
                 branch = await get_current_branch()
-                code, _, _ = await run_git_cmd("fetch", "origin", branch, timeout=30)
-                if code == 0:
+                fetch_ok, source_name, _ = await git_fetch_with_fallback(branch, timeout=30)
+                if fetch_ok:
                     code_remote, remote_hash, _ = await run_git_cmd("rev-parse", f"origin/{branch}")
                     code_local, local_hash, _ = await run_git_cmd("rev-parse", "HEAD")
 
@@ -544,7 +586,7 @@ async def auto_update_checker(client):
                     behind_count = int(behind_str) if (code_cnt == 0 and behind_str.isdigit()) else 0
 
                     snoozed_hash = get_config("module_update", "snoozed_hash", "")
-                    logger.debug(f"Фоновый чек: behind={behind_count}, remote={remote_hash[:7] if remote_hash else 'None'}, snoozed={snoozed_hash[:7] if snoozed_hash else 'None'}")
+                    logger.debug(f"Фоновый чек [{source_name}]: behind={behind_count}, remote={remote_hash[:7] if remote_hash else 'None'}, snoozed={snoozed_hash[:7] if snoozed_hash else 'None'}")
 
                     # Проверяем:
                     # 1. Есть коммиты позади (behind_count > 0)
@@ -558,7 +600,7 @@ async def auto_update_checker(client):
                         and remote_hash != snoozed_hash
                         and remote_hash != last_notified_hash
                     ):
-                        logger.info(f"Обнаружено {behind_count} новых коммитов в GitHub! Отправка уведомления владельцу...")
+                        logger.info(f"Обнаружено {behind_count} новых коммитов в {source_name}! Отправка уведомления владельцу...")
                         code_log, new_commits_log, _ = await run_git_cmd(
                             "log",
                             f"HEAD..origin/{branch}",
@@ -570,8 +612,9 @@ async def auto_update_checker(client):
                         if behind_count > 5:
                             commits_display += f"\n*...и еще {behind_count - 5} коммитов*"
 
+                        src_badge = f" *(Источник: {source_name})*" if source_name != "GitHub" else ""
                         msg = (
-                            f"🔔 **Доступно обновление UBTG!**\n\n"
+                            f"🔔 **Доступно обновление UBTG!**{src_badge}\n\n"
                             f"🌿 **Ветка:** `{branch}`\n"
                             f"🔢 **Новых коммитов:** `{behind_count}`\n\n"
                             f"📋 **Список изменений:**\n"
@@ -609,7 +652,7 @@ async def auto_update_checker(client):
 @register_cmd("update", desc="Проверить или установить обновления юзербота (.update / .update now / .update force)")
 async def update_cmd(client, event, args):
     """
-    Команда управления обновлениями юзербота из GitHub.
+    Команда управления обновлениями юзербота из GitHub / Gitea.
     Использование:
       .update — проверить наличие обновлений (интерактивный инлайн режим)
       .update now — мгновенно скачать обновления и перезапустить бота
@@ -631,7 +674,7 @@ async def update_cmd(client, event, args):
             "• `.update log [число]` — показать историю последних коммитов (по умолчанию 10)\n"
             "• `.version` — текущая версия и информация о коммите\n\n"
             "⏰ **Авто-проверка:** Каждые 15 минут в фоне бот проверяет обновления и присылает уведомление в ЛС.\n\n"
-            f"🔗 **Официальный репозиторий:**\n{OFFICIAL_REPO_URL}"
+            f"🔗 **Репозитории:**\n• [GitHub]({OFFICIAL_REPO_URL})\n• [Gitea]({GITEA_REPO_URL})"
         )
         return await event.edit(help_text)
 
@@ -657,7 +700,7 @@ async def update_cmd(client, event, args):
         msg = (
             f"📜 **История последних коммитов ({branch}):**\n\n"
             f"{logs_out}\n\n"
-            f"🔗 [GitHub Репозиторий]({OFFICIAL_REPO_URL})"
+            f"🔗 [GitHub]({OFFICIAL_REPO_URL}) | [Gitea]({GITEA_REPO_URL})"
         )
         return await event.edit(msg)
 
@@ -672,7 +715,7 @@ async def update_cmd(client, event, args):
         return
 
     # --- РЕЖИМ 4: ИНТЕРАКТИВНАЯ ПРОВЕРКА ОБНОВЛЕНИЙ (.update / .update check) ---
-    await event.edit("🔄 `Проверяю наличие обновлений на GitHub...`")
+    await event.edit("🔄 `Проверяю наличие обновлений...`")
 
     state = await check_updates_state()
     if not state.get("ok"):
@@ -715,14 +758,15 @@ async def version_cmd(client, event, args):
         f"📌 **Коммит:** {commit_line}\n"
         f"👤 **Автор коммита:** {author_line}\n"
         f"🐍 **Python:** `{sys.version.split()[0]}`\n"
-        f"🔗 **Репозиторий:** [GitHub]({OFFICIAL_REPO_URL})\n\n"
+        f"🔗 **Репозиторий:** [GitHub]({OFFICIAL_REPO_URL}) | [Gitea]({GITEA_REPO_URL})\n\n"
         "💡 *Для проверки обновлений используйте `.update`*"
     )
     await event.edit(text)
 
 
-@register_cmd("checkupdate", desc="Быстрая проверка наличия обновлений на GitHub")
+@register_cmd("checkupdate", desc="Быстрая проверка наличия обновлений (GitHub / Gitea)")
 async def check_update_alias(client, event, args):
     """Алиас для быстрой проверки обновлений."""
     await update_cmd(client, event, "check")
+
 

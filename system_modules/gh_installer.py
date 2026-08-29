@@ -7,6 +7,7 @@ import traceback
 import json
 import aiohttp
 import time
+import hashlib
 from telethon import Button, errors
 from registry import (
     register_cmd,
@@ -54,6 +55,38 @@ CACHE_TIMEOUT = 3600  # 1 час кэша
 _repo_cache = None
 _last_repo_update = 0
 _search_sessions = {}
+
+# Кэш удаленного содержимого файлов для быстрого сравнения хэшей
+_remote_content_cache = {}  # {path: (code, sha256, timestamp)}
+_REMOTE_CACHE_TTL = 300  # 5 минут
+
+
+def get_file_hash(content):
+    """Возвращает SHA-256 хэш строки кода (без лишних пробелов по краям)."""
+    if isinstance(content, str):
+        content = content.strip().encode("utf-8")
+    return hashlib.sha256(content).hexdigest()
+
+
+def get_local_module_code(file_name):
+    """Возвращает исходный код локально установленного модуля."""
+    mod_dir = get_modules_dir()
+    file_path = os.path.join(mod_dir, file_name)
+    if not os.path.exists(file_path):
+        return None
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return None
+
+
+def get_local_module_hash(file_name):
+    """Возвращает SHA-256 хэш локально установленного модуля."""
+    code = get_local_module_code(file_name)
+    if code is None:
+        return None
+    return get_file_hash(code)
 
 
 def get_modules_dir():
@@ -216,6 +249,45 @@ async def download_module_file(path_or_url, timeout=20):
     return None, f"Не удалось скачать файл ни с GitHub, ни с Gitea. ({last_error})", ""
 
 
+async def get_remote_module_content(path, timeout=15):
+    """
+    Получает код удаленного модуля с кэшированием хэша.
+    Возвращает (code: str | None, sha256: str | None).
+    """
+    now = time.time()
+    if path in _remote_content_cache:
+        code, sha, ts = _remote_content_cache[path]
+        if now - ts < _REMOTE_CACHE_TTL:
+            return code, sha
+
+    code, err, _ = await download_module_file(path, timeout=timeout)
+    if code is not None:
+        sha = get_file_hash(code)
+        _remote_content_cache[path] = (code, sha, now)
+        return code, sha
+    return None, None
+
+
+async def check_single_module_update(mod):
+    """
+    Проверяет, есть ли свежая версия для указанного модуля в репозитории.
+    Возвращает кортеж (is_installed: bool, has_update: bool).
+    """
+    file_name = mod["file_name"]
+    if not is_module_installed(file_name):
+        return False, False
+
+    local_hash = get_local_module_hash(file_name)
+    if not local_hash:
+        return True, False
+
+    path = mod.get("path") or mod["file_url"]
+    _, remote_hash = await get_remote_module_content(path)
+    if remote_hash and remote_hash != local_hash:
+        return True, True
+    return True, False
+
+
 def normalize_module_info(alias, raw_val, base_url=None):
     """
     Нормализует данные о модуле строго из полученного index.json.
@@ -287,8 +359,10 @@ def _clean_old_sessions():
 
 def build_card_view(session_id, index=0):
     """
-    Формирует карточку модуля. Если картинка отсутствует в индексе, она не отправляется.
-    Если описание отсутствует, выводится 'Описания не найдено'.
+    Формирует карточку модуля с отображением статуса:
+    - ⚪️ Не установлен (кнопка Установить)
+    - 🟢 Установлен / актуальная версия (кнопка Переустановить)
+    - 🟠 Доступно обновление! (кнопка Обновить)
     """
     session = _search_sessions.get(session_id)
     if not session:
@@ -306,7 +380,21 @@ def build_card_view(session_id, index=0):
 
     total = len(items)
     installed = is_module_installed(mod["file_name"])
-    status_str = "🟢 **Установлен**" if installed else "⚪️ **Не установлен**"
+    updates_map = session.get("updates_map", {})
+    has_update = updates_map.get(alias, False)
+
+    if not installed:
+        status_str = "⚪️ **Не установлен**"
+        action_btn_text = "📥 Установить"
+        action_cb = f"gh_inst:{mod['alias']}"
+    elif has_update:
+        status_str = "🟠 **Доступно обновление!**"
+        action_btn_text = "🆙 Обновить"
+        action_cb = f"gh_upd:{mod['alias']}"
+    else:
+        status_str = "🟢 **Установлен (актуальная версия)**"
+        action_btn_text = "🔄 Переустановить"
+        action_cb = f"gh_inst:{mod['alias']}"
 
     # Если картинки нет — маркер не добавляется вообще
     img_embed = f"[\u200b]({mod['image']})" if mod.get("image") else ""
@@ -346,10 +434,8 @@ def build_card_view(session_id, index=0):
             Button.inline("Вперед ▶️", f"gh_page:{session_id}:{next_idx}".encode())
         ])
 
-    # Ряд 2: Кнопка установки и переход к общему списку
-    action_btn_text = "🔄 Переустановить" if installed else "📥 Установить"
-    action_btn = Button.inline(action_btn_text, f"gh_inst:{mod['alias']}".encode())
-    
+    # Ряд 2: Кнопка установки/обновления и переход к общему списку
+    action_btn = Button.inline(action_btn_text, action_cb.encode())
     if total > 1:
         buttons.append([
             action_btn,
@@ -371,7 +457,7 @@ def build_card_view(session_id, index=0):
 
 def build_list_view(session_id):
     """
-    Формирует текстовый список всех найденных модулей с быстрыми кнопками.
+    Формирует текстовый список всех найденных модулей с быстрыми кнопками и статусом обновлений.
     """
     session = _search_sessions.get(session_id)
     if not session:
@@ -380,6 +466,7 @@ def build_list_view(session_id):
     items = session.get("items", [])
     total = len(items)
     repo_index = session.get("repo_index", {})
+    updates_map = session.get("updates_map", {})
     query_str = session.get("query", "")
     header = f"📋 **Найдено модулей ({total}) по запросу '{query_str}':**\n\n" if query_str != "all" else f"📋 **Все модули репозитория ({total}):**\n\n"
 
@@ -387,10 +474,21 @@ def build_list_view(session_id):
     for idx, alias in enumerate(items, 1):
         mod = normalize_module_info(alias, repo_index.get(alias, {}))
         installed = is_module_installed(mod["file_name"])
-        badge = "🟢" if installed else "⚪️"
+        has_update = updates_map.get(alias, False)
+        
+        if not installed:
+            badge = "⚪️"
+            upd_note = ""
+        elif has_update:
+            badge = "🆙"
+            upd_note = " — *(Доступно обновление!)*"
+        else:
+            badge = "🟢"
+            upd_note = ""
+
         raw_desc = mod.get("desc") or "Описания не найдено"
         desc_cut = raw_desc[:55] + "..." if len(raw_desc) > 55 else raw_desc
-        text += f"**{idx}.** {badge} **{mod['name']}** (`{alias}`)\n"
+        text += f"**{idx}.** {badge} **{mod['name']}** (`{alias}`){upd_note}\n"
         text += f"   └ *{desc_cut}*\n"
 
     text += "\n💡 *Нажмите на номер ниже для перехода к карточке или используйте `.ghinstall <имя>`*"
@@ -545,7 +643,7 @@ async def perform_module_install(client, chat_id, message_id, package_alias, eve
 
 
 # ==========================================
-# ОБРАБОТЧИКИ НАЖАТИЙ НА ИНЛАЙН КНОПКИ.
+# ОБРАБОТЧИКИ НАЖАТИЙ НА ИНЛАЙН КНОПКИ
 # ==========================================
 
 @register_callback("gh_page:")
@@ -588,7 +686,7 @@ async def cb_gh_list(event, data):
 
 @register_callback("gh_close:")
 async def cb_gh_close(event, data):
-    """Закрытие поискового меню."""
+    """Закрытие поискового или проверочного меню."""
     session_id = data[len("gh_close:"):]
     _search_sessions.pop(session_id, None)
     await event.answer("Закрыто")
@@ -596,7 +694,7 @@ async def cb_gh_close(event, data):
         await event.delete()
     except Exception:
         try:
-            await event.edit("❌ **Поиск закрыт.**", buttons=None)
+            await event.edit("❌ **Меню закрыто.**", buttons=None)
         except Exception:
             pass
 
@@ -606,12 +704,232 @@ async def cb_gh_install(event, data):
     """Кнопка 'Установить' / 'Переустановить' из карточки."""
     sender = await event.get_sender()
     if not is_authorized_user(sender.id):
-        return await event.answer("⚠️ Установка модулей доступна только владельцу!", alert=True)
+        return await event.answer("⚠️ Действие доступно только владельцу!", alert=True)
 
     alias = data[len("gh_inst:"):]
     await event.answer(f"🚀 Запуск установки '{alias}'...")
     msg_id = getattr(event, "message_id", None) or getattr(event, "id", 0)
     await perform_module_install(get_main_client(), event.chat_id, msg_id, alias, event=event)
+
+
+@register_callback("gh_upd:")
+async def cb_gh_update(event, data):
+    """Кнопка 'Обновить' для конкретного модуля из карточки или чекера."""
+    sender = await event.get_sender()
+    if not is_authorized_user(sender.id):
+        return await event.answer("⚠️ Действие доступно только владельцу!", alert=True)
+
+    alias = data[len("gh_upd:"):]
+    await event.answer(f"🚀 Обновляю модуль '{alias}'...")
+    msg_id = getattr(event, "message_id", None) or getattr(event, "id", 0)
+    await perform_bulk_upgrade(get_main_client(), event.chat_id, msg_id, force_all=False, target_alias=alias, event=event)
+
+
+@register_callback("gh_upd_all")
+async def cb_gh_update_all(event, data):
+    """Кнопка 'Обновить все доступные' из меню проверки обновлений."""
+    sender = await event.get_sender()
+    if not is_authorized_user(sender.id):
+        return await event.answer("⚠️ Действие доступно только владельцу!", alert=True)
+
+    await event.answer("🚀 Запуск обновления всех устаревших модулей...")
+    msg_id = getattr(event, "message_id", None) or getattr(event, "id", 0)
+    await perform_bulk_upgrade(get_main_client(), event.chat_id, msg_id, force_all=False, event=event)
+
+
+@register_callback("gh_check_recheck")
+async def cb_gh_check_recheck(event, data):
+    """Кнопка 'Проверить снова' в результатах проверки обновлений."""
+    sender = await event.get_sender()
+    if not is_authorized_user(sender.id):
+        return await event.answer("⚠️ Действие доступно только владельцу!", alert=True)
+
+    await event.answer("🔄 Проверяю обновления...")
+    await check_modules_cmd(get_main_client(), event, "")
+
+
+# ==========================================
+# ФУНКЦИЯ МАССОВОГО ОБНОВЛЕНИЯ СО СЧЁТЧИКОМ
+# ==========================================
+
+async def perform_bulk_upgrade(client, chat_id, message_id, force_all=False, target_alias=None, event=None):
+    """
+    Выполняет обновление модулей с живым счётчиком прогресса:
+    [X/Y] Обновлено: ..., Осталось: ..., Текущий модуль: ...
+    """
+    async def update_status(text_msg):
+        if event:
+            try:
+                await event.edit(text_msg, buttons=None)
+                return
+            except Exception:
+                pass
+        bot = get_bot()
+        if bot:
+            try:
+                await bot.edit_message(chat_id, message_id, text_msg, buttons=None)
+                return
+            except Exception:
+                pass
+        if client:
+            try:
+                await client.edit_message(chat_id, message_id, text_msg, buttons=None)
+                return
+            except Exception:
+                pass
+
+    try:
+        await update_status("🔄 `Загружаю индекс репозитория...`")
+        repo_index, err = await fetch_repo_index(force=True)
+        if repo_index is None:
+            return await update_status(f"❌ **Ошибка доступа к репозиторию:**\n`{err}`")
+
+        modules_dir = get_modules_dir()
+        if modules_dir not in sys.path:
+            sys.path.insert(0, modules_dir)
+
+        # Определение списка модулей для обновления
+        if target_alias:
+            if target_alias not in repo_index:
+                return await update_status(f"❌ Модуль `{target_alias}` не найден в репозитории.")
+            targets = [target_alias]
+        elif force_all:
+            # Все установленные модули из репозитория
+            targets = [
+                alias for alias, raw in repo_index.items()
+                if is_module_installed(normalize_module_info(alias, raw)["file_name"])
+            ]
+            if not targets:
+                return await update_status("🤷‍♂️ **Нет установленных модулей из репозитория.**")
+        else:
+            # Только те модули, у которых есть новая версия
+            await update_status("🔍 `Проверяю наличие обновлений для установленных модулей...`")
+            installed_modules = []
+            for alias, raw in repo_index.items():
+                mod = normalize_module_info(alias, raw)
+                if is_module_installed(mod["file_name"]):
+                    installed_modules.append((alias, mod))
+
+            if not installed_modules:
+                return await update_status(
+                    "🤷‍♂️ **Нет установленных модулей из репозитория.**\n"
+                    "💡 Используйте `.ghsearch all` для просмотра каталога."
+                )
+
+            targets = []
+            for alias, mod in installed_modules:
+                _, has_upd = await check_single_module_update(mod)
+                if has_upd:
+                    targets.append(alias)
+
+            if not targets:
+                count_inst = len(installed_modules)
+                return await update_status(
+                    f"✅ **Все установленные модули ({count_inst}) уже обновлены до актуальной версии!**\n\n"
+                    f"💡 *Если хотите принудительно переустановить все модули, используйте:* `.upgrade force`"
+                )
+
+        total_targets = len(targets)
+        upgraded = []
+        errors_list = []
+
+        for idx, alias in enumerate(targets, 1):
+            remaining = total_targets - idx
+            mod = normalize_module_info(alias, repo_index[alias])
+            mod_name = mod["name"]
+            file_name = mod["file_name"]
+            file_path = os.path.join(modules_dir, file_name)
+            path = mod.get("path") or mod["file_url"]
+
+            progress_bar = f"`[{idx}/{total_targets}]`"
+            status_text = (
+                f"⏳ **Обновление модулей** {progress_bar}\n\n"
+                f"⚙️ **Текущий:** `{mod_name}` (`{alias}`)\n"
+                f"📊 **Обновлено:** `{len(upgraded)}` | **Осталось:** `{remaining + 1}`\n\n"
+                f"🔹 `Скачивание исходного кода...`"
+            )
+            await update_status(status_text)
+
+            try:
+                code, dl_err, source_used = await download_module_file(path)
+                if code is None:
+                    errors_list.append(f"{mod_name} ({alias}): {dl_err}")
+                    continue
+
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(code)
+
+                # Очищаем кэш импорта
+                importlib.invalidate_caches()
+
+                # Проверка зависимостей
+                requires_match = re.search(r"^\s*#\s*requires:\s*(.+)$", code, re.MULTILINE | re.IGNORECASE)
+                deps = []
+                if requires_match:
+                    deps = [d.strip() for d in re.split(r"[\s,]+", requires_match.group(1)) if d.strip()]
+                if not deps and mod.get("requires"):
+                    deps = mod["requires"]
+                deps = [d for d in deps if d and d != mod["module_name"] and d != alias]
+
+                if deps:
+                    await update_status(
+                        f"⏳ **Обновление модулей** {progress_bar}\n\n"
+                        f"⚙️ **Текущий:** `{mod_name}` (`{alias}`)\n"
+                        f"📊 **Обновлено:** `{len(upgraded)}` | **Осталось:** `{remaining + 1}`\n\n"
+                        f"📦 `Установка зависимостей: {', '.join(deps)}...`"
+                    )
+                    for dep in deps:
+                        await pip_install(dep)
+
+                # Перезагрузка модуля
+                module_name = mod["module_name"]
+                try:
+                    importlib.invalidate_caches()
+                    if module_name in sys.modules:
+                        importlib.reload(sys.modules[module_name])
+                    else:
+                        importlib.import_module(module_name)
+                    upgraded.append(f"{mod_name} (`{alias}`) *({source_used})*")
+                except ModuleNotFoundError as err_mod:
+                    if err_mod.name and err_mod.name != module_name and err_mod.name != alias:
+                        await pip_install(err_mod.name)
+                        importlib.invalidate_caches()
+                        if module_name in sys.modules:
+                            importlib.reload(sys.modules[module_name])
+                        else:
+                            importlib.import_module(module_name)
+                        upgraded.append(f"{mod_name} (`{alias}`) *({source_used})*")
+                    else:
+                        errors_list.append(f"{mod_name} ({alias}): {err_mod}")
+
+            except Exception as e:
+                logger.error(f"Ошибка обновления {alias}: {e}")
+                errors_list.append(f"{mod_name} ({alias}): {type(e).__name__}")
+
+            await asyncio.sleep(0.3)
+
+        if upgraded:
+            await update_status("⏳ `Подготовка к перезапуску юзербота...`")
+            msg = (
+                f"🎉 **Обновление модулей успешно завершено!**\n\n"
+                f"🔝 **Обновлено ({len(upgraded)}/{total_targets}):**\n"
+                + "\n".join([f"• 🟢 {item}" for item in upgraded])
+            )
+            if errors_list:
+                msg += f"\n\n⚠️ **Ошибки ({len(errors_list)}):**\n" + "\n".join([f"• 🔴 {e}" for e in errors_list])
+            msg += "\n\n🔄 *Юзербот перезапущен для применения изменений.*"
+
+            target_client = client or get_main_client()
+            await restart_userbot(target_client, chat_id, message_id, custom_text=msg, event=event)
+        else:
+            msg = "🤷‍♂️ **Не удалось обновить выбранные модули.**\n"
+            if errors_list:
+                msg += f"\n⚠️ **Ошибки:**\n" + "\n".join([f"• 🔴 {e}" for e in errors_list])
+            await update_status(msg)
+
+    except Exception as e:
+        logger.error(f"Сбой в perform_bulk_upgrade: {e}\n{traceback.format_exc()}")
+        await update_status(f"❌ **Сбой при обновлении модулей:** `{e}`")
 
 
 # ==========================================
@@ -624,7 +942,7 @@ async def cb_gh_install(event, data):
 async def search_module_cmd(client, event, args):
     """
     Интерактивный поиск модулей в репозитории с показом баннеров, описания,
-    кнопкой установки, пагинацией карточек и списком.
+    кнопкой установки/обновления, пагинацией карточек и списком.
     """
     _clean_old_sessions()
     query = args.strip().lower() if args else "all"
@@ -654,11 +972,22 @@ async def search_module_cmd(client, event, args):
             f"💡 Введи `.ghsearch all` чтобы посмотреть все доступные модули."
         )
 
+    # Проверяем статусы обновлений для найденных установленных модулей
+    updates_map = {}
+    for alias in results:
+        raw_val = repo_index.get(alias)
+        if raw_val:
+            mod = normalize_module_info(alias, raw_val)
+            if is_module_installed(mod["file_name"]):
+                _, has_upd = await check_single_module_update(mod)
+                updates_map[alias] = has_upd
+
     session_id = f"ghs_{int(time.time() * 1000)}"
     _search_sessions[session_id] = {
         "query": query,
         "items": results,
         "repo_index": repo_index,
+        "updates_map": updates_map,
         "current_idx": 0,
         "chat_id": event.chat_id,
         "created_at": time.time()
@@ -692,6 +1021,124 @@ async def install_module_cmd(client, event, args):
     await perform_module_install(client, event.chat_id, event.id, package_alias, event=event)
 
 
+@register_cmd("ghcheck", desc="Проверить наличие обновлений для установленных модулей")
+@register_cmd("checkmods", desc="Алиас для .ghcheck")
+@register_cmd("ghupdates", desc="Алиас для .ghcheck")
+async def check_modules_cmd(client, event, args):
+    """
+    Проверяет наличие свежих версий установленных модулей в репозитории без их перезаписи.
+    """
+    await event.edit("🔍 `Проверяю наличие обновлений для установленных модулей...`")
+    repo_index, err = await fetch_repo_index(force=True)
+    if repo_index is None:
+        return await event.edit(f"❌ **Ошибка доступа к репозиторию:**\n`{err}`")
+
+    installed_modules = []
+    for alias, raw in repo_index.items():
+        mod = normalize_module_info(alias, raw)
+        if is_module_installed(mod["file_name"]):
+            installed_modules.append((alias, mod))
+
+    if not installed_modules:
+        return await event.edit(
+            "🤷‍♂️ **Ни один модуль из репозитория не установлен.**\n"
+            "💡 Используйте `.ghsearch all` для просмотра доступных модулей."
+        )
+
+    outdated = []
+    up_to_date = []
+
+    for alias, mod in installed_modules:
+        _, has_upd = await check_single_module_update(mod)
+        if has_upd:
+            outdated.append((alias, mod))
+        else:
+            up_to_date.append((alias, mod))
+
+    total = len(installed_modules)
+    buttons = []
+
+    if outdated:
+        msg = f"🔔 **Доступны обновления модулей (`{len(outdated)}/{total}`):**\n\n"
+        for alias, mod in outdated:
+            msg += f"🆙 **{mod['name']}** (`{alias}`) — *Доступна новая версия*\n"
+        
+        if up_to_date:
+            msg += f"\n🟢 **Актуальные модули (`{len(up_to_date)}`):**\n"
+            for alias, mod in up_to_date:
+                msg += f"• **{mod['name']}** (`{alias}`)\n"
+
+        msg += "\n💡 *Нажмите кнопку ниже для обновления или используйте `.upgrade`*"
+
+        btn_rows = []
+        btn_rows.append([Button.inline(f"🚀 Обновить все доступные ({len(outdated)})", b"gh_upd_all")])
+
+        # Индивидуальные кнопки для обновления (по 2 в ряд)
+        cur_row = []
+        for alias, mod in outdated[:6]:
+            cur_row.append(Button.inline(f"🆙 {mod['name'][:12]}", f"gh_upd:{alias}".encode()))
+            if len(cur_row) == 2:
+                btn_rows.append(cur_row)
+                cur_row = []
+        if cur_row:
+            btn_rows.append(cur_row)
+
+        btn_rows.append([
+            Button.inline("🔄 Проверить снова", b"gh_check_recheck"),
+            Button.inline("❌ Закрыть", f"gh_close:check".encode())
+        ])
+        buttons = btn_rows
+    else:
+        msg = f"✅ **Все установленные модули актуальны! (`{total}`):**\n\n"
+        for alias, mod in up_to_date:
+            msg += f"• 🟢 **{mod['name']}** (`{alias}`)\n"
+        msg += "\n💡 *Все версии совпадают с репозиторием. Обновления не требуются.*"
+
+        buttons = [
+            [
+                Button.inline("🔄 Проверить снова", b"gh_check_recheck"),
+                Button.inline("❌ Закрыть", f"gh_close:check".encode())
+            ]
+        ]
+
+    try:
+        await send_inline(
+            client,
+            event.chat_id,
+            msg,
+            buttons=buttons,
+            reply_to=getattr(event, "reply_to_msg_id", None)
+        )
+        await event.delete()
+    except Exception as inline_err:
+        logger.warning(f"check_modules send_inline fallback: {inline_err}")
+        await event.edit(msg)
+
+
+@register_cmd("upgrade", desc="Обновить установленные модули (.upgrade / .upgrade <имя> / .upgrade force)")
+@register_cmd("ghupgrade", desc="Алиас для .upgrade")
+@register_cmd("upgrademods", desc="Алиас для .upgrade")
+async def upgrade_cmd(client, event, args):
+    """
+    Обновляет установленные модули с живым счётчиком прогресса:
+    - Без аргументов: обновляет только те модули, у которых есть новая версия
+    - .upgrade <имя>: обновляет конкретный модуль
+    - .upgrade force / all: принудительно переустанавливает все установленные модули
+    """
+    raw_arg = args.strip() if args else ""
+    force = False
+    target = None
+
+    if raw_arg in ("force", "-f", "all", "*"):
+        force = True
+    elif raw_arg:
+        target = raw_arg.lower()
+        if target.endswith(".py"):
+            target = target[:-3]
+
+    await perform_bulk_upgrade(client, event.chat_id, event.id, force_all=force, target_alias=target, event=event)
+
+
 @register_cmd("updaterepo", desc="Принудительно обновить список модулей из репозитория (GitHub/Gitea)")
 async def update_repo_cmd(client, event, args):
     """Принудительно обновляет локальный кэш index.json."""
@@ -706,77 +1153,6 @@ async def update_repo_cmd(client, event, args):
     if err:
         msg += f"\n⚠️ *Заметка:* `{err}`"
         
-    await event.edit(msg)
-
-
-@register_cmd("upgrade", desc="Обновить индекс и все установленные модули из репозитория (GitHub/Gitea)")
-async def upgrade_cmd(client, event, args):
-    """Обновляет все локально установленные модули до последних версий из репозитория."""
-    await event.edit("🔄 `Обновляю индекс репозитория...`")
-    repo_index, err = await fetch_repo_index(force=True)
-    
-    if repo_index is None:
-        return await event.edit(f"❌ **Ошибка обновления репозитория:**\n`{err}`")
-        
-    modules_dir = get_modules_dir()
-    if modules_dir not in sys.path:
-        sys.path.insert(0, modules_dir)
-    upgraded = []
-    errors_list = []
-    
-    await event.edit("⏳ `Проверяю обновления для локальных модулей...`")
-    
-    for alias, raw_val in repo_index.items():
-        mod = normalize_module_info(alias, raw_val)
-        file_name = mod["file_name"]
-        file_path = os.path.join(modules_dir, file_name)
-        path = mod.get("path") or mod["file_url"]
-        
-        if os.path.exists(file_path):
-            try:
-                code, dl_err, source_used = await download_module_file(path)
-                if code is not None:
-                    with open(file_path, "w", encoding="utf-8") as f:
-                        f.write(code)
-                    
-                    importlib.invalidate_caches()
-                    module_name = mod["module_name"]
-                    try:
-                        if module_name in sys.modules:
-                            importlib.reload(sys.modules[module_name])
-                        else:
-                            importlib.import_module(module_name)
-                        upgraded.append(alias)
-                    except ModuleNotFoundError as err_mod:
-                        if err_mod.name and err_mod.name != module_name and err_mod.name != alias:
-                            await pip_install(err_mod.name)
-                            importlib.invalidate_caches()
-                            if module_name in sys.modules:
-                                importlib.reload(sys.modules[module_name])
-                            else:
-                                importlib.import_module(module_name)
-                            upgraded.append(alias)
-                        else:
-                            errors_list.append(f"{alias} ({err_mod})")
-                else:
-                    errors_list.append(f"{alias} ({dl_err})")
-            except Exception as e:
-                errors_list.append(f"{alias} ({type(e).__name__})")
-    
-    if upgraded:
-        await event.edit("⏳ `Подготовка и применение обновленных модулей...`")
-        msg = f"✅ **Обновление модулей завершено!**\n\n"
-        msg += f"🔝 **Обновлено ({len(upgraded)}):** `{', '.join(upgraded)}`\n"
-        if errors_list:
-            msg += f"⚠️ **Ошибки ({len(errors_list)}):** `{', '.join(errors_list)}`\n"
-        msg += "\n*(Совет: используй `.fixreq`, если после обновления модули требуют новых библиотек)*"
-        
-        await restart_userbot(client, event.chat_id, event.id, custom_text=msg)
-        return
-
-    msg = "🤷‍♂️ **Нет модулей для обновления.** (Ни один модуль из репозитория не установлен)\n"
-    if errors_list:
-        msg += f"⚠️ **Ошибки ({len(errors_list)}):** `{', '.join(errors_list)}`\n"
     await event.edit(msg)
 
 

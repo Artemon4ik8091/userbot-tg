@@ -545,7 +545,7 @@ async def perform_module_install(client, chat_id, message_id, package_alias, eve
 
 
 # ==========================================
-# ОБРАБОТЧИКИ НАЖАТИЙ НА ИНЛАЙН КНОПКИ
+# ОБРАБОТЧИКИ НАЖАТИЙ НА ИНЛАЙН КНОПКИ.
 # ==========================================
 
 @register_callback("gh_page:")

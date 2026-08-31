@@ -343,65 +343,187 @@ async def check_cmd_rate_limit():
     rate_limiter_state["last_cmd_time"] = time.time()
 
 # --- СИСТЕМА КОНФИГУРАЦИЙ ---
-CONFIG_FILE = "Global_config.json"
+# --- СИСТЕМА КОНФИГУРАЦИЙ И КАНОНИЗАЦИИ МОДУЛЕЙ ---
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Global_config.json")
 global_config = {}
 
+def normalize_module_name(name: str) -> str:
+    """
+    Единая функция канонизации имен модулей для предотвращения дубликатов в конфигурации.
+    Приводит любые варианты записи к единому каноническому имени.
+    Примеры:
+      'modules.compliments' -> 'compliments'
+      'system_modules.update' -> 'update'
+      'module_update' -> 'update'
+      'module_info' -> 'info'
+      'ping' -> 'module_ping'
+      'system_modules.module_ping' -> 'module_ping'
+    """
+    if not name or not isinstance(name, str):
+        return ""
+    
+    clean = name.strip()
+    if clean.endswith(".py"):
+        clean = clean[:-3]
+        
+    for prefix in ("modules.", "system_modules.", "init_modules."):
+        if clean.startswith(prefix):
+            clean = clean[len(prefix):]
+            break
+            
+    if "." in clean:
+        clean = clean.split(".")[-1]
+
+    # Словарь известных синонимов для приведения к единому каноническому имени
+    known_aliases = {
+        "module_update": "update",
+        "module_info": "info",
+        "ping": "module_ping",
+        "module_restart": "restart",
+        "module_settings": "settings",
+        "module_help": "help",
+        "module_installer": "installer",
+        "module_terminal": "terminal",
+        "module_gh_installer": "gh_installer"
+    }
+    
+    clean_lower = clean.lower()
+    if clean_lower in known_aliases:
+        return known_aliases[clean_lower]
+
+    return clean
+
 def load_config():
-    """Загружает конфигурацию из JSON файла"""
+    """
+    Загружает конфигурацию из JSON файла с автоматической дедупликацией
+    и объединением устаревших/дублирующихся ключей модулей.
+    """
     global global_config
+    loaded = {}
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
             try:
-                global_config = json.load(f)
+                loaded = json.load(f)
             except json.JSONDecodeError:
-                global_config = {}
-    else:
-        global_config = {}
+                loaded = {}
+    
+    cleaned = {}
+    needs_resave = False
+    
+    for raw_mod_name, params in loaded.items():
+        if not isinstance(params, dict):
+            continue
+        canon_name = normalize_module_name(raw_mod_name)
+        if canon_name != raw_mod_name:
+            needs_resave = True
+        
+        if canon_name not in cleaned:
+            cleaned[canon_name] = {}
+            
+        # Объединяем параметры (без перезаписи существующими дефолтами)
+        for k, v in params.items():
+            if k not in cleaned[canon_name] or cleaned[canon_name][k] != v:
+                cleaned[canon_name][k] = v
+                
+    global_config = cleaned
+    if needs_resave or (loaded and len(cleaned) != len(loaded)):
         save_config()
 
 def save_config():
-    """Сохраняет текущую конфигурацию в JSON файл"""
+    """Сохраняет текущую очищенную конфигурацию в JSON файл"""
     with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
         json.dump(global_config, f, indent=4, ensure_ascii=False)
 
 def get_config(module_name, key, default=None):
     """
-    Получает значение из конфига.
+    Получает значение из конфига с автоматической канонизацией имени модуля.
     Пример: get_config("module_ping", "reply_text", "Понг!")
     """
-    return global_config.get(module_name, {}).get(key, default)
+    canon = normalize_module_name(module_name)
+    if canon in global_config and isinstance(global_config[canon], dict) and key in global_config[canon]:
+        return global_config[canon][key]
+    if module_name in global_config and isinstance(global_config[module_name], dict) and key in global_config[module_name]:
+        return global_config[module_name][key]
+    return default
 
 def set_config(module_name, key, value):
     """
-    Записывает значение в конфиг и сохраняет файл.
+    Записывает значение в конфиг под каноническим именем модуля и удаляет дубликаты.
     Пример: set_config("module_ping", "reply_text", "Дарова!")
     """
-    if module_name not in global_config:
-        global_config[module_name] = {}
+    canon = normalize_module_name(module_name)
+    if canon not in global_config:
+        global_config[canon] = {}
     
-    global_config[module_name][key] = value
+    global_config[canon][key] = value
+    
+    # Удаляем устаревшие дубликаты из памяти
+    for alias in (module_name, f"modules.{canon}", f"system_modules.{canon}", f"module_{canon}"):
+        if alias != canon and alias in global_config:
+            del global_config[alias]
+            
     save_config()
+
+def delete_config(module_name, key=None):
+    """
+    Удаляет ключ или всю конфигурацию модуля (включая все возможные синонимы) и сохраняет файл.
+    Пример: delete_config("module_ping", "delay") или delete_config("module_ping")
+    """
+    global global_config
+    canon = normalize_module_name(module_name)
+    changed = False
+    
+    targets = [canon]
+    if module_name and module_name != canon:
+        targets.append(module_name)
+    targets.extend([f"modules.{canon}", f"system_modules.{canon}"])
+    
+    for mod in targets:
+        if mod in global_config:
+            if key is not None:
+                if key in global_config[mod]:
+                    del global_config[mod][key]
+                    changed = True
+                    if not global_config[mod]:
+                        del global_config[mod]
+            else:
+                del global_config[mod]
+                changed = True
+                
+    if changed:
+        save_config()
+    return changed
 
 def init_config(module_name, default_dict):
     """
-    Инициализирует дефолтные настройки модуля. 
+    Инициализирует дефолтные настройки модуля под каноническим именем. 
     Записывает их в конфиг, только если их там еще нет.
-    Вызывать в начале файла модуля.
     """
-    if module_name not in global_config:
-        global_config[module_name] = {}
+    canon = normalize_module_name(module_name)
+    if canon not in global_config:
+        global_config[canon] = {}
         
     changed = False
     for key, default_value in default_dict.items():
-        if key not in global_config[module_name]:
-            global_config[module_name][key] = default_value
+        if key not in global_config[canon]:
+            global_config[canon][key] = default_value
+            changed = True
+            
+    # Если в конфиге был старый ненормализованный ключ, переносим его данные
+    for alias in (module_name, f"modules.{canon}", f"system_modules.{canon}"):
+        if alias != canon and alias in global_config:
+            for k, v in global_config[alias].items():
+                if k not in global_config[canon]:
+                    global_config[canon][k] = v
+            del global_config[alias]
             changed = True
             
     if changed:
         save_config()
 
-# Загружаем конфиг при старте
+# Загружаем и автоматически дедуплицируем конфиг при старте
 load_config()
+
 
 
 # --- РЕЕСТР МОДУЛЕЙ И КОМАНД ---
@@ -413,12 +535,11 @@ modules_repo = {
 
 def set_module_meta(name, desc="Описания не найдено", system=False):
     """
-    Задает имя и описание для модуля (вызывать в начале файла).
-    system=True — модуль системный. Такие модули нельзя удалить через .uninstall,
-    и в .help они помечаются специальной пометкой "Системное".
+    Задает имя и описание для модуля с канонизацией идентификатора модуля.
     """
     frame = inspect.currentframe().f_back
-    module_id = inspect.getmodule(frame).__name__
+    raw_id = inspect.getmodule(frame).__name__
+    module_id = normalize_module_name(raw_id)
     
     if module_id not in modules_repo["modules"]:
         modules_repo["modules"][module_id] = {
@@ -434,11 +555,12 @@ def set_module_meta(name, desc="Описания не найдено", system=Fa
 
 def register_cmd(command_name, desc="Описания не найдено"):
     def decorator(func):
-        module_id = inspect.getmodule(func).__name__
+        raw_id = inspect.getmodule(func).__name__
+        module_id = normalize_module_name(raw_id)
         
         # Если модуль не задал о себе инфу через set_module_meta, даем ему дефолтное имя
         if module_id not in modules_repo["modules"]:
-            fallback_name = module_id.split('.')[-1].capitalize()
+            fallback_name = module_id.capitalize()
             modules_repo["modules"][module_id] = {
                 "name": fallback_name,
                 "desc": "Описания не найдено",

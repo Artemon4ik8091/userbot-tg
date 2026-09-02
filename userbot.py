@@ -56,7 +56,8 @@ from registry import (
     set_main_client,
     ensure_log_chat,
     get_log_chat_id,
-    set_log_chat_id
+    set_log_chat_id,
+    get_prefix
 )
 
 core_logger = get_logger("Core")
@@ -386,17 +387,24 @@ async def notify_after_restart():
         core_logger.debug(f"notify_after_restart exception: {e}")
 
 async def handle_incoming_messages(event):
-    if not event.out: return
+    if not event.out or not event.raw_text: return
     text = event.raw_text
 
-    if text.startswith('.'):
+    prefix = get_prefix()
+    if text.startswith(prefix):
         parts = text.split(maxsplit=1)
-        cmd, args = parts[0][1:], parts[1] if len(parts) > 1 else ""
+        first_word = parts[0]
+        if not first_word.startswith(prefix):
+            return
+        cmd = first_word[len(prefix):]
+        if not cmd:
+            return
+        args = parts[1] if len(parts) > 1 else ""
         if cmd in modules_repo["commands"]:
-            core_logger.debug(f"⚡ Вызов команды .{cmd} (аргументы: '{args}') в чате {event.chat_id}")
+            core_logger.debug(f"⚡ Вызов команды {prefix}{cmd} (аргументы: '{args}') в чате {event.chat_id}")
             if is_rate_limited():
                 rem = get_rate_limit_remaining()
-                core_logger.warning(f"Лимит API! Запрос .{cmd} заблокирован (осталось: {rem} сек.)")
+                core_logger.warning(f"Лимит API! Запрос {prefix}{cmd} заблокирован (осталось: {rem} сек.)")
                 await event.edit(f"⚠️ **Лимит API!**\n⏱ Осталось: `{rem} сек.`")
                 return
             try:
@@ -404,14 +412,14 @@ async def handle_incoming_messages(event):
                 start_t = time.perf_counter()
                 await modules_repo["commands"][cmd](client, event, args)
                 exec_dur = time.perf_counter() - start_t
-                core_logger.debug(f"✅ Команда .{cmd} выполнена за {exec_dur:.3f}с")
+                core_logger.debug(f"✅ Команда {prefix}{cmd} выполнена за {exec_dur:.3f}с")
             except errors.FloodWaitError as e:
-                core_logger.error(f"FloodWait в .{cmd}: {e.seconds} сек. (чат {event.chat_id})")
-                await apply_flood_wait(e.seconds, source=f"Команда .{cmd}")
+                core_logger.error(f"FloodWait в {prefix}{cmd}: {e.seconds} сек. (чат {event.chat_id})")
+                await apply_flood_wait(e.seconds, source=f"Команда {prefix}{cmd}")
                 await event.edit(f"⚠️ **FloodWait:** `{e.seconds} сек.`")
             except Exception as e:
-                core_logger.error(f"Ошибка при выполнении команды [.{cmd}] в чате {event.chat_id}:\n{traceback.format_exc()}")
-                await event.edit(f"**Ошибка [.{cmd}]:**\n`{e}`")
+                core_logger.error(f"Ошибка при выполнении команды [{prefix}{cmd}] в чате {event.chat_id}:\n{traceback.format_exc()}")
+                await event.edit(f"**Ошибка [{prefix}{cmd}]:**\n`{e}`")
 
 async def send_bot_status_msg(event):
     uptime_sec = int(time.time() - get_userbot_start_time())

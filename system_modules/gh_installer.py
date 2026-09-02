@@ -11,6 +11,7 @@ import hashlib
 from telethon import Button, errors
 from registry import (
     register_cmd,
+    register_bg,
     register_callback,
     set_module_meta,
     modules_repo,
@@ -19,7 +20,12 @@ from registry import (
     send_inline,
     get_owner_id,
     get_bot,
-    get_main_client
+    get_main_client,
+    get_config,
+    set_config,
+    init_config,
+    send_bot_notification,
+    get_prefix
 )
 
 logger = get_logger("GHInstaller")
@@ -27,9 +33,15 @@ logger = get_logger("GHInstaller")
 # Метаданные системного модуля
 set_module_meta(
     name="Package Manager",
-    desc="Установка модулей из репозитория Gitea/GitHub, поиск с фото и кнопками, обновление и удаление.",
+    desc="Установка модулей из репозитория Gitea/GitHub, фоновый чекер обновлений модулей, поиск с фото и кнопками.",
     system=True
 )
+
+init_config("gh_installer", {
+    "auto_check_modules": True,
+    "check_interval": 900,  # 15 минут в секундах
+    "snoozed_hashes": {}
+})
 
 # 🔗 Ссылки на репозитории (Основной: Gitea, Fallback: GitHub)
 REPO_SOURCES = [
@@ -55,6 +67,7 @@ CACHE_TIMEOUT = 3600  # 1 час кэша
 _repo_cache = None
 _last_repo_update = 0
 _search_sessions = {}
+_last_notified_module_hashes = {}  # {alias: remote_hash}
 
 # Кэш удаленного содержимого файлов для быстрого сравнения хэшей
 _remote_content_cache = {}  # {path: (code, sha256, timestamp)}
@@ -116,6 +129,19 @@ def is_module_installed(file_name_or_module_name):
         return False
     name = file_name_or_module_name if file_name_or_module_name.endswith('.py') else f"{file_name_or_module_name}.py"
     return os.path.exists(os.path.join(mod_dir, name))
+
+
+def find_installed_module_file(mod):
+    """Ищет установленный файл модуля в modules/ (по file_name, alias или module_name)."""
+    mod_dir = get_modules_dir()
+    if not os.path.exists(mod_dir):
+        return None
+    for candidate in [mod.get("file_name", ""), f"{mod.get('alias', '')}.py", f"{mod.get('module_name', '')}.py"]:
+        if candidate and candidate.endswith(".py"):
+            path = os.path.join(mod_dir, candidate)
+            if os.path.exists(path):
+                return candidate
+    return None
 
 
 async def pip_install(package_name):
@@ -625,6 +651,12 @@ async def perform_module_install(client, chat_id, message_id, package_alias, eve
                 await asyncio.sleep(1)
 
         if imported_successfully:
+            snoozed = get_config("gh_installer", "snoozed_hashes", {})
+            if isinstance(snoozed, dict) and package_alias in snoozed:
+                snoozed.pop(package_alias, None)
+                set_config("gh_installer", "snoozed_hashes", snoozed)
+            _last_notified_module_hashes.pop(package_alias, None)
+
             success_text = f"✅ **Пакет `{mod['name']}` (`{package_alias}`) успешно установлен!**\n🔄 *Перезапускаю юзербота для применения изменений...*"
             await update_status(success_text)
             await asyncio.sleep(0.3)
@@ -746,6 +778,210 @@ async def cb_gh_check_recheck(event, data):
 
     await event.answer("🔄 Проверяю обновления...")
     await check_modules_cmd(get_main_client(), event, "")
+
+
+@register_callback("bot_gh_upd_all")
+async def cb_bot_gh_update_all(event, data):
+    """Кнопка 'Обновить все' из уведомления встроенного бота."""
+    sender = await event.get_sender()
+    if not is_authorized_user(sender.id):
+        return await event.answer("⚠️ Действие доступно только владельцу!", alert=True)
+
+    await event.answer("🚀 Запуск обновления всех устаревших модулей...")
+    msg_id = getattr(event, "message_id", None) or getattr(event, "id", 0)
+    await perform_bulk_upgrade(get_main_client(), event.chat_id, msg_id, force_all=False, event=event)
+
+
+@register_callback("bot_gh_upd:")
+async def cb_bot_gh_update(event, data):
+    """Кнопка 'Обновить' конкретный модуль из уведомления встроенного бота."""
+    sender = await event.get_sender()
+    if not is_authorized_user(sender.id):
+        return await event.answer("⚠️ Действие доступно только владельцу!", alert=True)
+
+    alias = data[len("bot_gh_upd:"):]
+    await event.answer(f"🚀 Обновляю модуль '{alias}'...")
+    msg_id = getattr(event, "message_id", None) or getattr(event, "id", 0)
+    await perform_bulk_upgrade(get_main_client(), event.chat_id, msg_id, force_all=False, target_alias=alias, event=event)
+
+
+@register_callback("bot_gh_snooze")
+async def cb_bot_gh_snooze(event, data):
+    """Кнопка 'Отложить' из уведомления встроенного бота об обновлениях модулей."""
+    sender = await event.get_sender()
+    if not is_authorized_user(sender.id):
+        return await event.answer("⚠️ Действие доступно только владельцу!", alert=True)
+
+    repo_index, _ = await fetch_repo_index()
+    snoozed = get_config("gh_installer", "snoozed_hashes", {})
+    if not isinstance(snoozed, dict):
+        snoozed = {}
+
+    if repo_index:
+        for alias, raw in repo_index.items():
+            mod = normalize_module_info(alias, raw)
+            target_file = find_installed_module_file(mod)
+            if target_file:
+                path = mod.get("path") or mod["file_url"]
+                _, rem_hash = await get_remote_module_content(path)
+                loc_hash = get_local_module_hash(target_file)
+                if rem_hash and loc_hash and rem_hash != loc_hash:
+                    snoozed[alias] = rem_hash
+
+    set_config("gh_installer", "snoozed_hashes", snoozed)
+    await event.answer("⏳ Уведомление отложено")
+
+    p = get_prefix()
+    hint = (
+        "⏳ **Напоминание об обновлениях модулей отложено.**\n\n"
+        "Бот больше не будет напоминать об этих версиях.\n"
+        f"💡 Чтобы обновить их позже, используйте команду `{p}upgrade` "
+        "или нажмите кнопку ниже."
+    )
+    buttons = [[Button.inline("🚀 Обновить сейчас", b"bot_gh_upd_all")]]
+    try:
+        await event.edit(hint, buttons=buttons)
+    except errors.MessageNotModifiedError:
+        pass
+
+
+# ==========================================
+# ФОНОВАЯ ЗАДАЧА: АВТО-ПРОВЕРКА ОБНОВЛЕНИЙ МОДУЛЕЙ
+# ==========================================
+
+async def check_and_notify_module_updates():
+    """
+    Проверяет репозиторий на наличие свежих версий для установленных модулей.
+    Если найдены обновления, отправляет уведомление владельцу через встроенного бота.
+    """
+    repo_index, err = await fetch_repo_index(force=True)
+    if not repo_index:
+        logger.debug(f"Фоновый чек модулей: не удалось загрузить индекс: {err}")
+        return
+
+    installed_modules = []
+    for alias, raw in repo_index.items():
+        mod = normalize_module_info(alias, raw)
+        target_file = find_installed_module_file(mod)
+        if target_file:
+            mod["file_name"] = target_file
+            installed_modules.append((alias, mod))
+
+    if not installed_modules:
+        logger.debug("Фоновый чек модулей: нет установленных модулей из каталога репозитория.")
+        return
+
+    outdated = []
+    snoozed_hashes = get_config("gh_installer", "snoozed_hashes", {})
+    if not isinstance(snoozed_hashes, dict):
+        snoozed_hashes = {}
+
+    for alias, mod in installed_modules:
+        path = mod.get("path") or mod["file_url"]
+        _, remote_hash = await get_remote_module_content(path)
+        if not remote_hash:
+            continue
+
+        local_hash = get_local_module_hash(mod["file_name"])
+        if not local_hash:
+            continue
+
+        if remote_hash != local_hash:
+            outdated.append((alias, mod, remote_hash))
+
+    if not outdated:
+        logger.debug("Фоновый чек модулей: все установленные модули актуальны.")
+        return
+
+    # Проверяем, есть ли хотя бы один модуль с новым хэшем, о котором еще не уведомляли
+    needs_notification = False
+    for alias, mod, r_hash in outdated:
+        if snoozed_hashes.get(alias) != r_hash and _last_notified_module_hashes.get(alias) != r_hash:
+            needs_notification = True
+            break
+
+    if not needs_notification:
+        logger.debug("Фоновый чек модулей: уведомление об этих версиях уже было отправлено или отложено.")
+        return
+
+    p = get_prefix()
+    count = len(outdated)
+    lines = []
+    for alias, mod, r_hash in outdated:
+        lines.append(f"• 🆙 **{mod['name']}** (`{alias}`)")
+
+    msg = (
+        f"🔔 **Вышло обновление для модулей UBTG!**\n\n"
+        f"В репозитории обнаружены новые версии (`{count}`):\n"
+        + "\n".join(lines)
+        + f"\n\n💡 *Вы можете обновить их кнопкой ниже или командой `{p}upgrade`.*"
+    )
+
+    buttons = [
+        [Button.inline(f"🚀 Обновить все ({count})", b"bot_gh_upd_all")]
+    ]
+
+    # Индивидуальные кнопки для обновления первых модулей
+    indiv_row = []
+    for alias, mod, _ in outdated[:4]:
+        indiv_row.append(Button.inline(f"🆙 {mod['name'][:12]}", f"bot_gh_upd:{alias}".encode()))
+        if len(indiv_row) == 2:
+            buttons.append(indiv_row)
+            indiv_row = []
+    if indiv_row:
+        buttons.append(indiv_row)
+
+    buttons.append([Button.inline("⏳ Отложить", b"bot_gh_snooze")])
+
+    bot = get_bot()
+    owner_id = get_owner_id()
+    sent = False
+    if bot and owner_id:
+        try:
+            await bot.send_message(owner_id, msg, buttons=buttons)
+            sent = True
+            logger.info(f"Уведомление об обновлении {count} модулей успешно отправлено владельцу через бота.")
+        except Exception as ex:
+            logger.warning(f"Ошибка отправки уведомления о модулях ботом: {ex}")
+
+    if not sent:
+        await send_bot_notification(msg)
+
+    # Запоминаем отправленные хэши
+    for alias, mod, r_hash in outdated:
+        _last_notified_module_hashes[alias] = r_hash
+
+
+@register_bg()
+async def auto_module_update_checker(client):
+    """
+    Фоновый процесс: периодически опрашивает репозиторий модулей (Gitea / GitHub)
+    и сравнивает версии установленных модулей.
+    При выходе обновления присылает уведомление владельцу через встроенного бота.
+    """
+    logger.debug("Запуск фонового чекера авто-обновлений модулей...")
+    # Ждем 75 секунд после запуска, чтобы ядро успело полностью инициализироваться
+    await asyncio.sleep(75)
+
+    while True:
+        try:
+            enabled = get_config("gh_installer", "auto_check_modules", True)
+            if enabled:
+                await check_and_notify_module_updates()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Ошибка в фоновом чекере модулей: {e}")
+
+        interval = get_config("gh_installer", "check_interval", 900)
+        try:
+            interval = int(interval)
+            if interval < 60:
+                interval = 60
+        except (ValueError, TypeError):
+            interval = 900
+
+        await asyncio.sleep(interval)
 
 
 # ==========================================
@@ -909,6 +1145,13 @@ async def perform_bulk_upgrade(client, chat_id, message_id, force_all=False, tar
             await asyncio.sleep(0.3)
 
         if upgraded:
+            snoozed = get_config("gh_installer", "snoozed_hashes", {})
+            if isinstance(snoozed, dict):
+                for alias in targets:
+                    snoozed.pop(alias, None)
+                    _last_notified_module_hashes.pop(alias, None)
+                set_config("gh_installer", "snoozed_hashes", snoozed)
+
             await update_status("⏳ `Подготовка к перезапуску юзербота...`")
             msg = (
                 f"🎉 **Обновление модулей успешно завершено!**\n\n"

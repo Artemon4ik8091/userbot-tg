@@ -3,12 +3,18 @@ import sys
 import json
 import re
 import asyncio
-from registry import register_cmd, set_module_meta, restart_userbot
+from registry import (
+    register_cmd,
+    set_module_meta,
+    restart_userbot,
+    get_prefix,
+    set_prefix
+)
 
 # Системный модуль управления настройками ядра и встроенного бота
 set_module_meta(
     name="Settings",
-    desc="Системное управление настройками ядра юзербота и токеном встроенного бота.",
+    desc="Системное управление настройками ядра юзербота, префиксом команд и токеном встроенного бота.",
     system=True
 )
 
@@ -33,6 +39,7 @@ def save_core_config(config_data):
 @register_cmd("settings", desc="Показывает системную информацию о настройках ядра")
 async def settings_cmd(client, event, args):
     config = load_core_config()
+    p = get_prefix()
     bot_username = config.get("bot_username", "Не привязан")
     app_id = config.get("app_id", "Н/Д")
     log_chat_id = config.get("log_chat_id", "ubtg-logs (не настроен)")
@@ -46,14 +53,73 @@ async def settings_cmd(client, event, args):
 
     text = (
         "⚙️ **Системные Настройки Юзербота**\n\n"
+        f"⚡ **Префикс команд:** `{p}`\n"
         f"🤖 **Встроенный бот:** `@{bot_username}`\n"
         f"📁 **Чат логов ошибок:** `{log_chat_id}`\n"
         f"🔑 **App ID:** `{app_id}`\n"
         f"🌐 **Прокси:** `{proxy_status}`\n\n"
         "🛠 **Команды управления:**\n"
-        "• `.resettoken` — Сбросить токен бота в @BotFather и перезапустить ядро\n"
+        f"• `{p}setprefix <символ>` — Изменить префикс команд (например: `{p}setprefix !`)\n"
+        f"• `{p}prefix` — Посмотреть или изменить префикс команд\n"
+        f"• `{p}resettoken` — Сбросить токен бота в @BotFather и перезапустить ядро\n"
     )
     await event.edit(text)
+
+@register_cmd("setprefix", desc="Изменить префикс команд юзербота (.setprefix <символ>)")
+async def setprefix_cmd(client, event, args):
+    p = get_prefix()
+    raw_arg = (args or "").strip()
+
+    if not raw_arg:
+        return await event.edit(
+            f"⚡ **Текущий префикс команд:** `{p}`\n\n"
+            f"💡 **Использование:** `{p}setprefix <новый_префикс>`\n\n"
+            f"📌 **Примеры:**\n"
+            f"• `{p}setprefix !` — установить `!`\n"
+            f"• `{p}setprefix .` — вернуть стандартную точку `.`\n"
+            f"• `{p}setprefix ,` — установить запятую `,`\n"
+            f"• `{p}setprefix $` — установить знак доллара `$`\n"
+            f"• `{p}setprefix /` — установить слэш `/`\n\n"
+            f"⚠️ *Префикс не должен содержать пробельные символы и не может быть пустым.*"
+        )
+
+    # Снимаем внешние кавычки, если пользователь их передал
+    new_prefix = raw_arg
+    if (new_prefix.startswith('"') and new_prefix.endswith('"') and len(new_prefix) >= 2) or \
+       (new_prefix.startswith("'") and new_prefix.endswith("'") and len(new_prefix) >= 2):
+        new_prefix = new_prefix[1:-1].strip()
+
+    if not new_prefix:
+        return await event.edit("❌ **Ошибка:** Префикс не может быть пустым!")
+
+    if any(c.isspace() for c in new_prefix):
+        return await event.edit("❌ **Ошибка:** Префикс не должен содержать пробельные символы!")
+
+    if len(new_prefix) > 10:
+        return await event.edit("❌ **Ошибка:** Префикс слишком длинный (максимум 10 символов)!")
+
+    if new_prefix == p:
+        return await event.edit(f"⚠️ **Префикс `{new_prefix}` уже установлен!**")
+
+    try:
+        old_prefix = p
+        set_prefix(new_prefix)
+        await event.edit(
+            f"✅ **Префикс команд успешно изменен!**\n\n"
+            f"🔹 Было: `{old_prefix}`\n"
+            f"🔹 Стало: `{new_prefix}`\n\n"
+            f"💡 **Теперь команды вызываются с новым префиксом:**\n"
+            f"• `{new_prefix}help`\n"
+            f"• `{new_prefix}settings`\n"
+            f"• `{new_prefix}setprefix {old_prefix}` *(чтобы вернуть назад)*\n\n"
+            f"*(Изменения применились мгновенно, перезагрузка не требуется)*"
+        )
+    except Exception as e:
+        await event.edit(f"❌ **Ошибка при смене префикса:**\n`{e}`")
+
+@register_cmd("prefix", desc="Посмотреть или изменить префикс команд (алиас для .setprefix)")
+async def prefix_cmd_alias(client, event, args):
+    await setprefix_cmd(client, event, args)
 
 @register_cmd("resettoken", desc="Сбрасывает токен встроенного бота через @BotFather, обновляет core_conf.json и перезапускает бот.")
 async def reset_token_cmd(client, event, args):

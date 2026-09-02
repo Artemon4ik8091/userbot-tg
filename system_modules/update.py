@@ -17,7 +17,8 @@ from registry import (
     set_config,
     init_config,
     get_logger,
-    get_main_client
+    get_main_client,
+    get_prefix
 )
 
 logger = get_logger("Update")
@@ -238,6 +239,7 @@ async def check_updates_state():
     logger.debug(f"Состояние [{source_name}]: behind={behind_count}, ahead={ahead_count}, commit={current_commit.get('short_hash') if current_commit else 'None'}")
 
     new_commits_log = ""
+    modified_modules = []
     if behind_count > 0:
         code_log, logs_out, _ = await run_git_cmd(
             "log",
@@ -249,6 +251,15 @@ async def check_updates_state():
         if code_log == 0 and logs_out:
             new_commits_log = logs_out
 
+        code_diff, diff_out, _ = await run_git_cmd("diff", "--name-only", f"HEAD..origin/{branch}")
+        if code_diff == 0 and diff_out:
+            for f in diff_out.splitlines():
+                f = f.strip()
+                if f.startswith("modules/") and f.endswith(".py"):
+                    modified_modules.append(os.path.basename(f)[:-3])
+                elif f.startswith("system_modules/") and f.endswith(".py"):
+                    modified_modules.append(f"{os.path.basename(f)[:-3]} (системный)")
+
     return {
         "ok": True,
         "branch": branch,
@@ -256,7 +267,8 @@ async def check_updates_state():
         "behind_count": behind_count,
         "ahead_count": ahead_count,
         "current_commit": current_commit,
-        "new_commits_log": new_commits_log
+        "new_commits_log": new_commits_log,
+        "modified_modules": modified_modules
     }
 
 
@@ -269,6 +281,7 @@ def build_update_ui(state):
     ahead_count = state.get("ahead_count", 0)
     current_commit = state.get("current_commit")
     new_commits_log = state.get("new_commits_log", "")
+    modified_modules = state.get("modified_modules", [])
     source_name = state.get("source_name", "Gitea")
 
     cur_hash_str = f"`{current_commit['short_hash']}`" if current_commit else "Н/Д"
@@ -283,10 +296,15 @@ def build_update_ui(state):
         if behind_count > 10:
             commits_display += f"\n*...и еще {behind_count - 10} коммитов*"
 
+        mods_section = ""
+        if modified_modules:
+            mods_section = f"📦 **Затронутые модули:** {', '.join(f'`{m}`' for m in modified_modules)}\n\n"
+
         text = (
             f"📦 **Доступно обновление UBTG!**{src_badge}\n\n"
             f"🌿 **Ветка:** `{branch}`\n"
             f"🔢 **Новых коммитов:** `{behind_count}`\n\n"
+            f"{mods_section}"
             f"📋 **Список изменений:**\n"
             f"{commits_display}\n\n"
             f"💡 **Выберите действие:**"
@@ -613,11 +631,27 @@ async def auto_update_checker(client):
                         if behind_count > 5:
                             commits_display += f"\n*...и еще {behind_count - 5} коммитов*"
 
+                        # Определяем, какие модули затронуты в обновлении
+                        code_diff, diff_out, _ = await run_git_cmd("diff", "--name-only", f"HEAD..origin/{branch}")
+                        mod_lines = []
+                        if code_diff == 0 and diff_out:
+                            for f in diff_out.splitlines():
+                                f = f.strip()
+                                if f.startswith("modules/") and f.endswith(".py"):
+                                    mod_lines.append(os.path.basename(f)[:-3])
+                                elif f.startswith("system_modules/") and f.endswith(".py"):
+                                    mod_lines.append(f"{os.path.basename(f)[:-3]} (системный)")
+
+                        mods_section = ""
+                        if mod_lines:
+                            mods_section = f"📦 **Затронутые модули:** {', '.join(f'`{m}`' for m in mod_lines)}\n\n"
+
                         src_badge = f" *(Источник: {source_name})*" if source_name != "Gitea" else ""
                         msg = (
                             f"🔔 **Доступно обновление UBTG!**{src_badge}\n\n"
                             f"🌿 **Ветка:** `{branch}`\n"
                             f"🔢 **Новых коммитов:** `{behind_count}`\n\n"
+                            f"{mods_section}"
                             f"📋 **Список изменений:**\n"
                             f"{commits_display}\n\n"
                             f"💡 **Выберите действие:**"
@@ -666,15 +700,16 @@ async def update_cmd(client, event, args):
 
     # Справка по модулю
     if subcmd in ("help", "h", "?"):
+        p = get_prefix()
         help_text = (
             "🔄 **Модуль обновления UBTG**\n\n"
             "**Команды:**\n"
-            "• `.update` — интерактивная проверка обновлений с инлайн-кнопками\n"
-            "• `.update now` (или `.update pull`) — мгновенно скачать обновление и перезапустить бота\n"
-            "• `.update force` (или `.update -f`) — принудительно обновить (сбросить локальные конфликты)\n"
-            "• `.update log [число]` — показать историю последних коммитов (по умолчанию 10)\n"
-            "• `.version` — текущая версия и информация о коммите\n\n"
-            "⏰ **Авто-проверка:** Каждые 15 минут в фоне бот проверяет обновления и присылает уведомление в ЛС.\n\n"
+            f"• `{p}update` — интерактивная проверка обновлений с инлайн-кнопками\n"
+            f"• `{p}update now` (или `{p}update pull`) — мгновенно скачать обновление и перезапустить бота\n"
+            f"• `{p}update force` (или `{p}update -f`) — принудительно обновить (сбросить локальные конфликты)\n"
+            f"• `{p}update log [число]` — показать историю последних коммитов (по умолчанию 10)\n"
+            f"• `{p}version` — текущая версия и информация о коммите\n\n"
+            "⏰ **Авто-проверка:** Каждые 15 минут в фоне бот проверяет обновления ядра и модулей и присылает уведомление в ЛС.\n\n"
             f"🔗 **Репозитории:**\n• [Gitea]({GITEA_REPO_URL})\n• [GitHub]({GITHUB_REPO_URL})"
         )
         return await event.edit(help_text)

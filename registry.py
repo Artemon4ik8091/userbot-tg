@@ -342,6 +342,73 @@ async def check_cmd_rate_limit():
         await asyncio.sleep(rate_limiter_state["min_interval"] - elapsed)
     rate_limiter_state["last_cmd_time"] = time.time()
 
+# --- ПРЕФИКС КОМАНД ЮЗЕРБОТА ---
+CORE_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "core_conf.json")
+_current_prefix = None
+
+def get_prefix() -> str:
+    """Возвращает текущий префикс команд юзербота (по умолчанию '.')"""
+    global _current_prefix
+    if _current_prefix:
+        return _current_prefix
+
+    if os.path.exists(CORE_CONFIG_FILE):
+        try:
+            with open(CORE_CONFIG_FILE, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+                prefix_val = cfg.get("cmd_prefix") or cfg.get("prefix")
+                if prefix_val and isinstance(prefix_val, str) and not any(c.isspace() for c in prefix_val):
+                    _current_prefix = prefix_val
+                    return _current_prefix
+        except Exception:
+            pass
+
+    _current_prefix = "."
+    return _current_prefix
+
+def set_prefix(new_prefix: str) -> str:
+    """Устанавливает новый префикс команд и сохраняет его в core_conf.json"""
+    global _current_prefix
+    if not new_prefix or not isinstance(new_prefix, str):
+        raise ValueError("Префикс не может быть пустым")
+
+    clean = new_prefix.strip()
+    if (clean.startswith('"') and clean.endswith('"') and len(clean) >= 2) or \
+       (clean.startswith("'") and clean.endswith("'") and len(clean) >= 2):
+        clean = clean[1:-1].strip()
+
+    if not clean:
+        raise ValueError("Префикс не может быть пустым")
+    if any(c.isspace() for c in clean):
+        raise ValueError("Префикс не должен содержать пробельные символы")
+    if len(clean) > 10:
+        raise ValueError("Префикс слишком длинный (максимум 10 символов)")
+
+    _current_prefix = clean
+
+    cfg = {}
+    if os.path.exists(CORE_CONFIG_FILE):
+        try:
+            with open(CORE_CONFIG_FILE, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception:
+            cfg = {}
+
+    cfg["cmd_prefix"] = clean
+    try:
+        with open(CORE_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=4, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"Не удалось сохранить префикс в core_conf.json: {e}")
+
+    return _current_prefix
+
+def reload_prefix() -> str:
+    """Перечитывает префикс из core_conf.json"""
+    global _current_prefix
+    _current_prefix = None
+    return get_prefix()
+
 # --- СИСТЕМА КОНФИГУРАЦИЙ ---
 # --- СИСТЕМА КОНФИГУРАЦИЙ И КАНОНИЗАЦИИ МОДУЛЕЙ ---
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Global_config.json")

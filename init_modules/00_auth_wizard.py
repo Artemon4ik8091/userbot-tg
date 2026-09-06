@@ -10,7 +10,7 @@ import threading
 import asyncio
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
-from telethon import errors
+from telethon import errors, types
 
 # --- КОНСТАНТЫ И АРГУМЕНТЫ CLI ---
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -110,8 +110,36 @@ def save_core_config(config_data):
         json.dump(config_data, f, indent=4, ensure_ascii=False)
 
 
+def get_code_delivery_info(sent_code_obj):
+    """Определяет канал доставки кода (приложение Telegram, SMS, звонок и т.д.) по объекту SentCode."""
+    delivery_type = "unknown"
+    delivery_hint = "Код подтверждения отправлен в приложение Telegram или по SMS."
+    if not sent_code_obj or not hasattr(sent_code_obj, "type"):
+        return delivery_type, delivery_hint, 5
+
+    stype = sent_code_obj.type
+    if isinstance(stype, types.auth.SentCodeTypeApp):
+        delivery_type = "app"
+        delivery_hint = "Код отправлен в ваше приложение Telegram (в чат уведомлений Telegram от 777000). В SMS код не отправляется!"
+    elif isinstance(stype, types.auth.SentCodeTypeSms):
+        delivery_type = "sms"
+        delivery_hint = "Код отправлен в SMS на ваш номер телефона."
+    elif isinstance(stype, (types.auth.SentCodeTypeCall, types.auth.SentCodeTypeFlashCall, types.auth.SentCodeTypeMissedCall)):
+        delivery_type = "call"
+        delivery_hint = "Код будет сообщен при входящем звонке на ваш телефон."
+    elif isinstance(stype, types.auth.SentCodeTypeEmailCode):
+        delivery_type = "email"
+        delivery_hint = "Код отправлен на вашу электронную почту."
+    elif isinstance(stype, types.auth.SentCodeTypeFragmentSms):
+        delivery_type = "fragment"
+        delivery_hint = "Код отправлен через сервис Fragment SMS."
+
+    length = getattr(stype, "length", 5)
+    return delivery_type, delivery_hint, length
+
+
 def apply_preconfigured_credentials():
-    if not SET_APP_ID and not SET_HASH_ID and not SET_PROXY_IP and not SET_PROXY_PORT and not SET_PROXY_PROTOCOL:
+    if not SET_APP_ID and not SET_HASH_ID and not SET_PROXY_IP and not SET_PROXY_PORT and not SET_PROXY_PROTOCOL and not NO_PROXY_SETUP:
         return False
 
     config_data = {}
@@ -144,6 +172,8 @@ def apply_preconfigured_credentials():
                 raise ValueError("--set-proxy-port должен быть числом")
         if SET_PROXY_PROTOCOL:
             proxy_config["proxy_type"] = SET_PROXY_PROTOCOL
+    elif NO_PROXY_SETUP:
+        config_data.pop("proxy", None)
 
     save_core_config(config_data)
     return True
@@ -1401,6 +1431,12 @@ def close_qr_ui(server, tunnel_process):
 
 def setup_config():
     """Синхронный хук, вызывается ядром до создания TelegramClient"""
+    try:
+        apply_preconfigured_credentials()
+    except ValueError as e:
+        print(f"[Init:Auth] ⚠️ {e}")
+        raise
+
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -1409,14 +1445,6 @@ def setup_config():
                     return config
         except Exception as e:
             print(f"[Init:Auth] ⚠️ Ошибка при чтении конфига: {e}. Создаем новый.")
-
-    try:
-        if apply_preconfigured_credentials():
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except ValueError as e:
-        print(f"[Init:Auth] ⚠️ {e}")
-        raise
 
     if "--no-web" in sys.argv:
         return prompt_for_core_config()
@@ -1543,6 +1571,9 @@ async def pre_auth(client):
     phone_in_progress = False
     sent_code_obj = None
     current_phone = None
+    current_delivery_type = "unknown"
+    current_delivery_hint = ""
+    current_code_length = 5
 
     try:
         while True:
@@ -1571,8 +1602,15 @@ async def pre_auth(client):
                     try:
                         sent_code_obj = await client.send_code_request(current_phone)
                         phone_in_progress = True
-                        print(f"[Init:Auth] 📩 Код отправлен на {current_phone}!")
-                        write_auth_status("waiting_code", phone=current_phone)
+                        current_delivery_type, current_delivery_hint, current_code_length = get_code_delivery_info(sent_code_obj)
+                        print(f"[Init:Auth] 📩 {current_delivery_hint} ({current_phone})")
+                        write_auth_status(
+                            "waiting_code",
+                            phone=current_phone,
+                            delivery_type=current_delivery_type,
+                            delivery_hint=current_delivery_hint,
+                            code_length=current_code_length
+                        )
                         try:
                             with open(PHONE_CODE_FILE, "w", encoding="utf-8") as f:
                                 f.write("")
@@ -1581,7 +1619,7 @@ async def pre_auth(client):
                         if server:
                             server.phone_waiting_code = True
                             server.phone_error = None
-                            server.qr_status = f"Код отправлен на {current_phone}. Введите код."
+                            server.qr_status = f"{current_delivery_hint} Введите код."
                     except errors.PhoneNumberInvalidError:
                         err = "Некорректный номер телефона."
                         print(f"[Init:Auth] ❌ {err}")
@@ -1621,6 +1659,9 @@ async def pre_auth(client):
                     phone_in_progress = False
                     sent_code_obj = None
                     current_phone = None
+                    current_delivery_type = "unknown"
+                    current_delivery_hint = ""
+                    current_code_length = 5
                     write_auth_status("waiting_qr")
                     if server:
                         server.phone_waiting_code = False
@@ -1637,8 +1678,19 @@ async def pre_auth(client):
                     print(f"[Init:Auth] 🔄 Повторный запрос отправки кода на {current_phone}...")
                     try:
                         sent_code_obj = await client.send_code_request(current_phone)
-                        write_auth_status("waiting_code", phone=current_phone)
-                        print(f"[Init:Auth] 📩 Новый код отправлен на {current_phone}!")
+                        current_delivery_type, current_delivery_hint, current_code_length = get_code_delivery_info(sent_code_obj)
+                        write_auth_status(
+                            "waiting_code",
+                            phone=current_phone,
+                            delivery_type=current_delivery_type,
+                            delivery_hint=current_delivery_hint,
+                            code_length=current_code_length
+                        )
+                        print(f"[Init:Auth] 📩 Новый код отправлен на {current_phone}! ({current_delivery_hint})")
+                        if server:
+                            server.phone_waiting_code = True
+                            server.phone_error = None
+                            server.qr_status = f"{current_delivery_hint} Введите код."
                     except errors.FloodWaitError as e:
                         err = f"Слишком много попыток. Подождите {e.seconds} секунд."
                         print(f"[Init:Auth] ❌ {err}")
@@ -1691,7 +1743,15 @@ async def pre_auth(client):
                     except errors.PhoneCodeInvalidError:
                         err = "Введен неверный код."
                         print(f"[Init:Auth] ❌ {err}")
-                        write_auth_status("waiting_code", phone=current_phone, error="invalid_code", message=err)
+                        write_auth_status(
+                            "waiting_code",
+                            phone=current_phone,
+                            error="invalid_code",
+                            message=err,
+                            delivery_type=current_delivery_type,
+                            delivery_hint=current_delivery_hint,
+                            code_length=current_code_length
+                        )
                         if server:
                             server.phone_error = err
                     except errors.PhoneCodeExpiredError:
@@ -1700,6 +1760,8 @@ async def pre_auth(client):
                         write_auth_status("error", phone=current_phone, error="code_expired", message=err)
                         phone_in_progress = False
                         sent_code_obj = None
+                        current_delivery_type = "unknown"
+                        current_delivery_hint = ""
                         if os.path.exists(PHONE_FILE):
                             try: os.remove(PHONE_FILE)
                             except Exception: pass

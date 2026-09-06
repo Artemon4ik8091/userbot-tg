@@ -2,3 +2,6 @@ telethon
 qrcode
 pillow
 psutil
+PySocks
+aiohttp
+python-socks

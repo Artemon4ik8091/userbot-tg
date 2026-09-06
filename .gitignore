@@ -16,3 +16,6 @@ qr.png
 qr.svg
 __pycache__/
 nekospy_cache/
+node_modules/
+package-lock.json
+package.json

@@ -23,6 +23,10 @@ QR_IMAGE_FILE = os.path.join(BASE_DIR, "qr.png")
 QR_SVG_FILE = os.path.join(BASE_DIR, "qr.svg")
 PASSWORD_FILE = os.path.join(BASE_DIR, "password.txt")
 BOT_NAME_FILE = os.path.join(BASE_DIR, "bot_name.txt")
+PHONE_FILE = os.path.join(BASE_DIR, "phone.txt")
+PHONE_CODE_FILE = os.path.join(BASE_DIR, "phone_code.txt")
+PHONE_RESEND_FILE = os.path.join(BASE_DIR, "phone_resend.txt")
+AUTH_STATUS_FILE = os.path.join(BASE_DIR, "auth_status.json")
 ALL_LINK_FILES = (
     AUTH_LINK_FILE,
     AUTH_URL_FILE,
@@ -31,7 +35,11 @@ ALL_LINK_FILES = (
     QR_IMAGE_FILE,
     QR_SVG_FILE,
     PASSWORD_FILE,
-    BOT_NAME_FILE
+    BOT_NAME_FILE,
+    PHONE_FILE,
+    PHONE_CODE_FILE,
+    PHONE_RESEND_FILE,
+    AUTH_STATUS_FILE
 )
 WEB_SETUP_HOST = "127.0.0.1"
 WEB_SETUP_TIMEOUT = 600
@@ -45,6 +53,7 @@ SET_HASH_ID = None
 SET_PROXY_IP = None
 SET_PROXY_PORT = None
 SET_PROXY_PROTOCOL = None
+SET_PHONE = None
 WEB_SETUP_SERVER = None
 
 for index, arg in enumerate(sys.argv):
@@ -58,11 +67,41 @@ for index, arg in enumerate(sys.argv):
         SET_PROXY_PORT = sys.argv[index + 1]
     if arg == "--set-proxy-protocol" and index + 1 < len(sys.argv):
         SET_PROXY_PROTOCOL = sys.argv[index + 1]
+    if arg == "--phone" and index + 1 < len(sys.argv):
+        SET_PHONE = sys.argv[index + 1]
     if arg in ("--port", "-p", "--web-port", "--set-web-port", "--set-port") and index + 1 < len(sys.argv):
         try:
             SET_WEB_PORT = int(sys.argv[index + 1])
         except ValueError:
             print(f"[Init:Auth] ⚠️ Некорректный номер порта: {sys.argv[index + 1]}")
+
+
+def write_auth_status(status, phone=None, error=None, message=None, **extra):
+    """Записывает текущий статус авторизации в auth_status.json для мониторинга внешними сервисами."""
+    data = {"status": status}
+    if phone:
+        data["phone"] = phone
+    if error:
+        data["error"] = error
+    if message:
+        data["message"] = message
+    data.update(extra)
+    try:
+        with open(AUTH_STATUS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"[Init:Auth] ⚠️ Не удалось записать {AUTH_STATUS_FILE}: {e}")
+
+
+def read_auth_status():
+    """Считывает auth_status.json, если он существует."""
+    if os.path.exists(AUTH_STATUS_FILE):
+        try:
+            with open(AUTH_STATUS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
 
 
 def save_core_config(config_data):
@@ -449,7 +488,11 @@ class WebConfigRequestHandler(BaseHTTPRequestHandler):
         status_text = getattr(self.server, "qr_status", "Ожидаю QR-код для входа в аккаунт...")
         qr_svg = getattr(self.server, "qr_svg", None)
         qr_url = getattr(self.server, "qr_url", "")
-        page_title = "QR-код для входа"
+        phone_waiting_code = getattr(self.server, "phone_waiting_code", False)
+        phone_error = getattr(self.server, "phone_error", None)
+        current_phone = getattr(self.server, "current_phone", "")
+        page_title = "Вход в Telegram"
+        is_waiting_code_js = "true" if phone_waiting_code else "false"
         
         qr_html = ""
         if qr_svg:
@@ -457,12 +500,42 @@ class WebConfigRequestHandler(BaseHTTPRequestHandler):
         else:
             qr_html = '<div class="spinner"></div>'
 
+        error_html = f'<div class="warning" style="margin-bottom: 16px;">{phone_error}</div>' if phone_error else ""
+
+        if phone_waiting_code:
+            content_html = f"""
+            <div style="background: rgba(15, 23, 42, 0.6); padding: 24px; border-radius: 18px; border: 1px solid rgba(255,255,255,0.1); margin-top: 16px;">
+                <h2 style="margin-top:0; font-size:1.4rem;">🔑 Введите код подтверждения</h2>
+                <p style="color:#94a3b8; font-size:0.95rem;">Код отправлен на номер <b>{current_phone}</b> (в Telegram или SMS).</p>
+                <div id="error-container">{error_html}</div>
+                <form method="post" action="/phone_code">
+                    <input type="text" name="code" placeholder="12345" required autofocus style="text-align:center;letter-spacing:6px;font-size:1.4rem;font-weight:600;margin-bottom:12px;">
+                    <button type="submit" class="btn-primary" style="width:100%;">Подтвердить и войти</button>
+                </form>
+                <form method="post" action="/phone_cancel" style="margin-top:10px;">
+                    <button type="submit" class="btn-secondary" style="width:100%;padding:10px 16px;font-size:0.9rem;">« Отмена (к QR-коду)</button>
+                </form>
+            </div>
+            """
+        else:
+            content_html = f"""
+            <div id="qr-container">{qr_html}</div>
+            <div id="qr-url" class="url">{qr_url if qr_url else 'Ожидание ссылки...'}</div>
+            <div style="margin-top: 24px; padding-top: 20px; border-top: 1px solid rgba(255,255,255,0.1);">
+                <div style="font-weight:600;margin-bottom:8px;font-size:1.05rem;">📞 Или войдите по номеру телефона:</div>
+                <div id="error-container">{error_html}</div>
+                <form method="post" action="/phone_login">
+                    <input type="tel" id="phone-input" name="phone" placeholder="+79991234567" style="margin-bottom:10px;" value="{current_phone}">
+                    <button type="submit" class="btn-secondary" style="width:100%;padding:12px 16px;font-size:0.95rem;">Получить код для входа</button>
+                </form>
+            </div>
+            """
+
         html = f"""<!DOCTYPE html>
 <html lang="ru">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="refresh" content="3">
   <title>{page_title}</title>
   <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
   <style>
@@ -472,21 +545,99 @@ class WebConfigRequestHandler(BaseHTTPRequestHandler):
     .card {{ max-width: 500px; width: 100%; background: var(--card-bg); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); border: 1px solid var(--card-border); border-radius: 24px; padding: 40px 32px; box-shadow: 0 30px 60px rgba(0,0,0,0.4); animation: scaleIn 0.5s cubic-bezier(0.16, 1, 0.3, 1); }}
     @keyframes scaleIn {{ from {{ opacity: 0; transform: scale(0.95); }} to {{ opacity: 1; transform: scale(1); }} }}
     h1 {{ margin: 0 0 16px; font-size: 1.8rem; font-weight: 700; }}
-    .banner {{ padding: 16px; border-radius: 14px; background: rgba(99,102,241,0.1); border: 1px solid rgba(99,102,241,0.2); color: #818cf8; margin-bottom: 32px; font-weight: 500; font-size: 1.05rem; line-height: 1.5; }}
+    .banner {{ padding: 16px; border-radius: 14px; background: rgba(99,102,241,0.1); border: 1px solid rgba(99,102,241,0.2); color: #818cf8; margin-bottom: 24px; font-weight: 500; font-size: 1.05rem; line-height: 1.5; }}
+    .warning {{ background: rgba(239,68,68,0.1); border: 1px solid rgba(239,68,68,0.2); color: #f87171; font-weight: 500; line-height: 1.5; padding: 12px 16px; border-radius: 12px; font-size: 0.95rem; }}
     .qr-box {{ background: white; padding: 20px; border-radius: 20px; display: inline-block; box-shadow: 0 0 0 rgba(99,102,241,0.4); border: 4px solid rgba(255,255,255,0.05); animation: pulse 2s infinite; }}
     @keyframes pulse {{ 0% {{ box-shadow: 0 0 0 0 rgba(99,102,241,0.4); }} 70% {{ box-shadow: 0 0 0 15px rgba(99,102,241,0); }} 100% {{ box-shadow: 0 0 0 0 rgba(99,102,241,0); }} }}
     .url {{ word-break: break-all; color: #94a3b8; margin-top: 24px; font-size: 0.85rem; padding: 12px; background: rgba(0,0,0,0.2); border-radius: 10px; }}
     .spinner {{ display: inline-block; width: 40px; height: 40px; border: 4px solid rgba(255,255,255,0.1); border-left-color: var(--accent); border-radius: 50%; animation: loader 1s linear infinite; margin: 20px auto; }}
     @keyframes loader {{ to {{ transform: rotate(360deg); }} }}
+    input {{ width: 100%; padding: 14px 16px; border-radius: 14px; border: 1px solid rgba(255,255,255,0.1); background: rgba(15, 23, 42, 0.5); color: var(--text); font-family: inherit; font-size: 1rem; box-sizing: border-box; transition: all 0.2s; }}
+    input:focus {{ outline: none; border-color: var(--accent); background: rgba(15, 23, 42, 0.8); box-shadow: 0 0 0 4px rgba(99,102,241,0.15); }}
+    button {{ cursor: pointer; font-weight: 600; font-size: 1rem; padding: 14px 28px; border-radius: 14px; border: none; transition: all 0.2s ease; font-family: inherit; }}
+    button:hover {{ transform: translateY(-2px); }}
+    .btn-primary {{ background: linear-gradient(135deg, #6366f1, #a855f7); color: white; box-shadow: 0 10px 20px rgba(99,102,241,0.3); }}
+    .btn-secondary {{ background: rgba(255,255,255,0.05); color: var(--text); border: 1px solid var(--card-border); }}
+    .btn-secondary:hover {{ background: rgba(255,255,255,0.1); }}
   </style>
 </head>
 <body>
   <div class="card">
     <h1>Вход в Telegram</h1>
-    <div class="banner">{status_text}</div>
-    {qr_html}
-    <div class="url">{qr_url if qr_url else 'Ожидание ссылки...'}</div>
+    <div id="status-banner" class="banner">{status_text}</div>
+    {content_html}
   </div>
+
+  <script>
+    const isWaitingCode = {is_waiting_code_js};
+    const phoneInput = document.getElementById('phone-input');
+    if (phoneInput) {{
+      const saved = sessionStorage.getItem('ub_saved_phone');
+      if (saved && !phoneInput.value) {{
+        phoneInput.value = saved;
+      }}
+      phoneInput.addEventListener('input', () => {{
+        sessionStorage.setItem('ub_saved_phone', phoneInput.value);
+      }});
+    }}
+
+    let pollInterval = setInterval(async () => {{
+      try {{
+        const res = await fetch('/status');
+        if (!res.ok) return;
+        const data = await res.json();
+
+        if (data.show_success) {{
+          window.location.href = '/success';
+          return;
+        }}
+        if (data.show_bot_setup) {{
+          window.location.href = '/bot_setup';
+          return;
+        }}
+        if (data.show_2fa) {{
+          window.location.href = '/2fa';
+          return;
+        }}
+
+        // Если сменилось состояние ожидания кода подтверждения — обновляем страницу
+        if (Boolean(data.phone_waiting_code) !== isWaitingCode) {{
+          window.location.reload();
+          return;
+        }}
+
+        // Обновляем статус в баннере
+        const banner = document.getElementById('status-banner');
+        if (banner && data.qr_status && banner.textContent !== data.qr_status) {{
+          banner.textContent = data.qr_status;
+        }}
+
+        // Обновляем QR-код без перезагрузки страницы
+        if (!isWaitingCode) {{
+          const qrBox = document.getElementById('qr-container');
+          if (qrBox && data.qr_svg) {{
+            if (!qrBox.innerHTML.includes(data.qr_svg)) {{
+              qrBox.innerHTML = '<div class="qr-box">' + data.qr_svg + '</div>';
+            }}
+          }}
+          const qrUrl = document.getElementById('qr-url');
+          if (qrUrl && data.qr_url && qrUrl.textContent !== data.qr_url) {{
+            qrUrl.textContent = data.qr_url;
+          }}
+        }}
+
+        // Обновляем ошибки если появились
+        const errBox = document.getElementById('error-container');
+        if (errBox) {{
+          if (data.phone_error) {{
+            errBox.innerHTML = '<div class="warning" style="margin-bottom: 16px;">' + data.phone_error + '</div>';
+          }} else {{
+            errBox.innerHTML = '';
+          }}
+        }}
+      }} catch (err) {{}}
+    }}, 2000);
+  </script>
 </body>
 </html>"""
         self.send_response(200)
@@ -597,6 +748,43 @@ class WebConfigRequestHandler(BaseHTTPRequestHandler):
                 self.send_error(404, "QR image not found")
                 return
 
+        # 0.0 JSON-статус авторизации для динамического обновления без перезагрузки страницы
+        if parsed_path.path == "/status":
+            status_data = {
+                "qr_status": getattr(self.server, "qr_status", "Ожидаю QR-код для входа в аккаунт..."),
+                "qr_svg": getattr(self.server, "qr_svg", None),
+                "qr_url": getattr(self.server, "qr_url", ""),
+                "phone_waiting_code": bool(getattr(self.server, "phone_waiting_code", False)),
+                "phone_error": getattr(self.server, "phone_error", None),
+                "current_phone": getattr(self.server, "current_phone", ""),
+                "show_2fa": bool(getattr(self.server, "show_2fa_page", False)),
+                "show_bot_setup": bool(getattr(self.server, "show_bot_setup_page", False)),
+                "show_success": bool(getattr(self.server, "show_success_page", False)),
+            }
+            body = json.dumps(status_data).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        # 0.1 Отмена входа по телефону
+        if parsed_path.path == "/phone_cancel":
+            self.server.phone_waiting_code = False
+            self.server.phone_error = None
+            self.server.requested_phone = None
+            self.server.current_phone = ""
+            for fp in (PHONE_FILE, PHONE_CODE_FILE):
+                if os.path.exists(fp):
+                    try:
+                        os.remove(fp)
+                    except Exception:
+                        pass
+            self._send_redirect("/qr")
+            return
+
         # 1. Страница Успеха
         if getattr(self.server, "show_success_page", False):
             if parsed_path.path != "/success":
@@ -657,6 +845,50 @@ class WebConfigRequestHandler(BaseHTTPRequestHandler):
         def first_value(key):
             values = form.get(key, [])
             return values[0].strip() if values else ""
+
+        # --- Обработка запроса кода по телефону ---
+        if parsed_path.path == "/phone_login":
+            phone = first_value("phone")
+            if phone:
+                self.server.current_phone = phone
+                self.server.requested_phone = phone
+                self.server.phone_waiting_code = False
+                self.server.phone_error = None
+                try:
+                    with open(PHONE_FILE, "w", encoding="utf-8") as f:
+                        f.write(phone)
+                except Exception:
+                    pass
+            self._send_redirect("/qr")
+            return
+
+        # --- Обработка ввода кода из Telegram ---
+        if parsed_path.path == "/phone_code":
+            code = first_value("code")
+            if code:
+                self.server.phone_code = code
+                try:
+                    with open(PHONE_CODE_FILE, "w", encoding="utf-8") as f:
+                        f.write(code)
+                except Exception:
+                    pass
+            self._send_redirect("/qr")
+            return
+
+        # --- Отмена входа по телефону ---
+        if parsed_path.path == "/phone_cancel":
+            self.server.phone_waiting_code = False
+            self.server.phone_error = None
+            self.server.requested_phone = None
+            self.server.current_phone = ""
+            for fp in (PHONE_FILE, PHONE_CODE_FILE):
+                if os.path.exists(fp):
+                    try:
+                        os.remove(fp)
+                    except Exception:
+                        pass
+            self._send_redirect("/qr")
+            return
 
         # --- Обработка формы Настройки Бота ---
         if parsed_path.path == "/bot_setup":
@@ -824,6 +1056,15 @@ def create_and_start_web_server(base_port=8080, max_attempts=100):
             server.bot_setup_event = threading.Event()
             server.password_2fa = None
             server.error_msg = None
+
+            # Состояния для Phone Auth
+            server.phone_waiting_code = False
+            server.phone_error = None
+            server.current_phone = ""
+            server.requested_phone = None
+            server.phone_code = None
+            server.phone_event = threading.Event()
+            server.phone_code_event = threading.Event()
 
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
@@ -1189,119 +1430,332 @@ def setup_config():
         print("\n[Init:Auth] ⚠️ Настройка прервана. Переключаюсь на консольный ввод.")
         return prompt_for_core_config()
 
-async def pre_auth(client):
-    """Асинхронный хук, вызывается ядром сразу после запуска TelegramClient, но до авторизации."""
-    if await client.is_user_authorized():
-        # Если юзер уже авторизован, молча пропускаем этот этап
-        return
-
-    print("=== Запуск генерации QR-кода ===")
-    qr_login = await client.qr_login()
-    
-    # Немедленно генерируем и сохраняем картинку qr.png на диске
-    save_qr_image(qr_login.url)
-    print(f"🔗 Telegram-ссылка для авторизации: {qr_login.url}")
-    if os.path.exists(QR_IMAGE_FILE):
-        print(f"🖼 QR-код сохранен в файл: {QR_IMAGE_FILE}")
-    elif os.path.exists(QR_SVG_FILE):
-        print(f"🖼 QR-код сохранен в файл: {QR_SVG_FILE}")
-
-    server, tunnel_process = setup_qr_web_ui()
-    update_qr_ui(qr_login.url, "Сканируйте QR-код в приложении Telegram для входа в аккаунт.")
-    
-    try:
-        while True:
-            try:
-                await qr_login.wait(timeout=20)
-                await handle_bot_naming(server)
-                break
-            except asyncio.TimeoutError:
-                print("[Init:Auth] Время жизни QR-кода истекло, генерируем новый (авто-обновление)...")
-                await qr_login.recreate()
-                save_qr_image(qr_login.url)
-                update_qr_ui(qr_login.url, "Время действия предыдущего QR-кода истекло. Отсканируйте новый.")
-                print(f"🔗 Новая Telegram-ссылка для авторизации: {qr_login.url}")
-                if os.path.exists(QR_IMAGE_FILE):
-                    print(f"🖼 Обновленный QR-код сохранен в файл: {QR_IMAGE_FILE}")
-                elif os.path.exists(QR_SVG_FILE):
-                    print(f"🖼 Обновленный QR-код сохранен в файл: {QR_SVG_FILE}")
-    except errors.SessionPasswordNeededError:
-        error_msg = None
-        while True:
-            show_2fa_ui(error_msg)
+async def handle_2fa_flow(client, server):
+    """Обрабатывает ввод 2FA облачного пароля через файл password.txt, веб-интерфейс или консоль."""
+    error_msg = None
+    while True:
+        show_2fa_ui(error_msg)
+        if server:
             server.password_event.clear()
-            
-            print(f"[Init:Auth] 🔒 Требуется облачный пароль (2FA)!")
-            print(f"[Init:Auth] Ожидание пароля из файла {PASSWORD_FILE}, веб-интерфейса или консоли...")
-            
-            # Создаем пустой файл password.txt для тг-бота
+
+        print(f"[Init:Auth] 🔒 Требуется облачный пароль (2FA)!")
+        print(f"[Init:Auth] Ожидание пароля из файла {PASSWORD_FILE}, веб-интерфейса или консоли...")
+
+        try:
+            with open(PASSWORD_FILE, "w", encoding="utf-8") as f:
+                f.write("")
+        except Exception as e:
+            print(f"[Init:Auth] ⚠️ Не удалось создать {PASSWORD_FILE}: {e}")
+
+        def console_input_thread(srv):
+            pwd = input("Ваш 2FA пароль: ").strip()
+            if srv and not srv.password_event.is_set() and pwd:
+                srv.password_2fa = pwd
+                srv.password_event.set()
+
+        if server:
+            threading.Thread(target=console_input_thread, args=(server,), daemon=True).start()
+
+        password = None
+        while server and not server.password_event.is_set():
+            if os.path.exists(PASSWORD_FILE):
+                try:
+                    with open(PASSWORD_FILE, "r", encoding="utf-8") as f:
+                        content = f.read().strip()
+                    if content:
+                        password = content
+                        break
+                except Exception:
+                    pass
+            await asyncio.sleep(0.5)
+
+        if not password and server and server.password_event.is_set():
+            password = server.password_2fa
+        if not password and not server:
+            password = input("Ваш 2FA пароль: ").strip()
+
+        try:
+            await client.sign_in(password=password)
+            if os.path.exists(PASSWORD_FILE):
+                try:
+                    os.remove(PASSWORD_FILE)
+                except Exception:
+                    pass
+            print("[Init:Auth] Ура! Успешно залогинились (с облачным паролем 2FA)!")
+            break
+        except errors.PasswordHashInvalidError:
+            error_msg = "Неверный пароль. Попробуйте еще раз."
+            print(f"\n[Init:Auth] ❌ {error_msg}")
             try:
                 with open(PASSWORD_FILE, "w", encoding="utf-8") as f:
                     f.write("")
-            except Exception as e:
-                print(f"[Init:Auth] ⚠️ Не удалось создать {PASSWORD_FILE}: {e}")
-            
-            # Запускаем ввод пароля в консоли как фоновый процесс
-            def console_input_thread(srv):
-                pwd = input("Ваш 2FA пароль: ").strip()
-                if not srv.password_event.is_set() and pwd:
-                    srv.password_2fa = pwd
-                    srv.password_event.set()
-            
-            threading.Thread(target=console_input_thread, args=(server,), daemon=True).start()
-            
-            password = None
-            while not server.password_event.is_set():
-                if os.path.exists(PASSWORD_FILE):
-                    try:
-                        with open(PASSWORD_FILE, "r", encoding="utf-8") as f:
-                            content = f.read().strip()
-                        if content:
-                            password = content
-                            break
-                    except Exception:
-                        pass
-                await asyncio.sleep(0.5)
-                
-            if not password and server.password_event.is_set():
-                password = server.password_2fa
-            
+            except Exception:
+                pass
+        except Exception as e:
+            error_msg = f"Произошла ошибка при входе: {e}"
+            print(f"\n[Init:Auth] ❌ {error_msg}")
             try:
-                await client.sign_in(password=password)
-                if os.path.exists(PASSWORD_FILE):
+                with open(PASSWORD_FILE, "w", encoding="utf-8") as f:
+                    f.write("")
+            except Exception:
+                pass
+
+
+async def pre_auth(client):
+    """Асинхронный хук, вызывается ядром сразу после запуска TelegramClient, но до авторизации."""
+    if await client.is_user_authorized():
+        return
+
+    # Проверяем CLI аргумент --phone
+    if SET_PHONE:
+        try:
+            with open(PHONE_FILE, "w", encoding="utf-8") as f:
+                f.write(SET_PHONE.strip())
+        except Exception:
+            pass
+
+    server = None
+    tunnel_process = None
+    if "--no-web" not in sys.argv:
+        try:
+            server, tunnel_process = setup_qr_web_ui()
+        except Exception as e:
+            print(f"[Init:Auth] ⚠️ Не удалось поднять веб-сервер: {e}")
+
+    write_auth_status("waiting_qr")
+    qr_login = None
+
+    try:
+        qr_login = await client.qr_login()
+        save_qr_image(qr_login.url)
+        print("=== Запуск генерации QR-кода ===")
+        print(f"🔗 Telegram-ссылка для авторизации: {qr_login.url}")
+        if os.path.exists(QR_IMAGE_FILE):
+            print(f"🖼 QR-код сохранен в файл: {QR_IMAGE_FILE}")
+        elif os.path.exists(QR_SVG_FILE):
+            print(f"🖼 QR-код сохранен в файл: {QR_SVG_FILE}")
+
+        if server:
+            update_qr_ui(qr_login.url, "Сканируйте QR-код в приложении Telegram или используйте вход по номеру телефона.")
+    except Exception as e:
+        print(f"[Init:Auth] Предупреждение при старте QR-логина: {e}")
+
+    phone_in_progress = False
+    sent_code_obj = None
+    current_phone = None
+
+    try:
+        while True:
+            # 1. Проверяем, не запрошена ли авторизация по телефону (через phone.txt или веб-сервер)
+            if not phone_in_progress:
+                req_phone = None
+                if os.path.exists(PHONE_FILE):
                     try:
-                        os.remove(PASSWORD_FILE)
+                        with open(PHONE_FILE, "r", encoding="utf-8") as f:
+                            c = f.read().strip()
+                        if c:
+                            req_phone = c
                     except Exception:
                         pass
-                
-                print("[Init:Auth] Ура! Успешно залогинились (с облачным паролем 2FA)!")
-                await handle_bot_naming(server)
-                break
-            except errors.PasswordHashInvalidError:
-                error_msg = "Неверный пароль. Попробуйте еще раз."
-                print(f"\n[Init:Auth] ❌ {error_msg}")
+                elif server and getattr(server, "requested_phone", None):
+                    req_phone = server.requested_phone
+                    server.requested_phone = None
+
+                if req_phone:
+                    current_phone = req_phone
+                    print(f"\n[Init:Auth] 📞 Запрос авторизации по номеру: {current_phone}")
+                    write_auth_status("sending_code", phone=current_phone)
+                    if server:
+                        server.current_phone = current_phone
+                        server.qr_status = f"Отправка кода на {current_phone}..."
+                    try:
+                        sent_code_obj = await client.send_code_request(current_phone)
+                        phone_in_progress = True
+                        print(f"[Init:Auth] 📩 Код отправлен на {current_phone}!")
+                        write_auth_status("waiting_code", phone=current_phone)
+                        try:
+                            with open(PHONE_CODE_FILE, "w", encoding="utf-8") as f:
+                                f.write("")
+                        except Exception:
+                            pass
+                        if server:
+                            server.phone_waiting_code = True
+                            server.phone_error = None
+                            server.qr_status = f"Код отправлен на {current_phone}. Введите код."
+                    except errors.PhoneNumberInvalidError:
+                        err = "Некорректный номер телефона."
+                        print(f"[Init:Auth] ❌ {err}")
+                        write_auth_status("error", phone=current_phone, error="invalid_phone", message=err)
+                        if os.path.exists(PHONE_FILE):
+                            try: os.remove(PHONE_FILE)
+                            except Exception: pass
+                        if server:
+                            server.phone_error = err
+                            server.qr_status = err
+                    except errors.FloodWaitError as e:
+                        err = f"Слишком много попыток. Подождите {e.seconds} секунд."
+                        print(f"[Init:Auth] ❌ {err}")
+                        write_auth_status("error", phone=current_phone, error="flood_wait", seconds=e.seconds, message=err)
+                        if os.path.exists(PHONE_FILE):
+                            try: os.remove(PHONE_FILE)
+                            except Exception: pass
+                        if server:
+                            server.phone_error = err
+                            server.qr_status = err
+                    except Exception as e:
+                        err = f"Ошибка отправки кода: {e}"
+                        print(f"[Init:Auth] ❌ {err}")
+                        write_auth_status("error", phone=current_phone, error="generic", message=err)
+                        if os.path.exists(PHONE_FILE):
+                            try: os.remove(PHONE_FILE)
+                            except Exception: pass
+                        if server:
+                            server.phone_error = err
+                            server.qr_status = err
+
+            # 2. Если авторизация по телефону активна, ожидаем код
+            if phone_in_progress:
+                # Проверяем, не отменили ли ввод телефона (например, удалили phone.txt)
+                if not os.path.exists(PHONE_FILE) and (not server or not getattr(server, "phone_waiting_code", False)):
+                    print("[Init:Auth] 🔄 Авторизация по телефону отменена. Возврат к QR...")
+                    phone_in_progress = False
+                    sent_code_obj = None
+                    current_phone = None
+                    write_auth_status("waiting_qr")
+                    if server:
+                        server.phone_waiting_code = False
+                        server.phone_error = None
+                        server.qr_status = "Ожидаю вход по QR-коду..."
+                    continue
+
+                # Проверяем запрос на повторную отправку кода
+                if os.path.exists(PHONE_RESEND_FILE):
+                    try:
+                        os.remove(PHONE_RESEND_FILE)
+                    except Exception:
+                        pass
+                    print(f"[Init:Auth] 🔄 Повторный запрос отправки кода на {current_phone}...")
+                    try:
+                        sent_code_obj = await client.send_code_request(current_phone)
+                        write_auth_status("waiting_code", phone=current_phone)
+                        print(f"[Init:Auth] 📩 Новый код отправлен на {current_phone}!")
+                    except errors.FloodWaitError as e:
+                        err = f"Слишком много попыток. Подождите {e.seconds} секунд."
+                        print(f"[Init:Auth] ❌ {err}")
+                        write_auth_status("error", phone=current_phone, error="flood_wait", seconds=e.seconds, message=err)
+                    except Exception as e:
+                        err = f"Ошибка повторной отправки кода: {e}"
+                        print(f"[Init:Auth] ❌ {err}")
+                        write_auth_status("error", phone=current_phone, error="resend_failed", message=err)
+
+                code_val = None
+                if os.path.exists(PHONE_CODE_FILE):
+                    try:
+                        with open(PHONE_CODE_FILE, "r", encoding="utf-8") as f:
+                            c = f.read().strip()
+                        if c:
+                            code_val = c
+                    except Exception:
+                        pass
+                elif server and getattr(server, "phone_code", None):
+                    code_val = server.phone_code
+                    server.phone_code = None
+
+                if code_val:
+                    print(f"[Init:Auth] 🔑 Получен код подтверждения: {code_val}. Выполняется вход...")
+                    try:
+                        with open(PHONE_CODE_FILE, "w", encoding="utf-8") as f:
+                            f.write("")
+                    except Exception:
+                        pass
+                    try:
+                        await client.sign_in(phone=current_phone, code=code_val, phone_code_hash=sent_code_obj.phone_code_hash)
+                        print("[Init:Auth] 🎉 Успешно авторизовались по номеру телефона!")
+                        write_auth_status("authorized", phone=current_phone)
+                        for fp in (PHONE_FILE, PHONE_CODE_FILE, AUTH_STATUS_FILE):
+                            if os.path.exists(fp):
+                                try: os.remove(fp)
+                                except Exception: pass
+                        if server:
+                            server.phone_waiting_code = False
+                        await handle_bot_naming(server)
+                        break
+                    except errors.SessionPasswordNeededError:
+                        print("[Init:Auth] 🔒 Требуется облачный пароль (2FA)!")
+                        write_auth_status("waiting_2fa", phone=current_phone)
+                        if server:
+                            server.phone_waiting_code = False
+                        await handle_2fa_flow(client, server)
+                        await handle_bot_naming(server)
+                        break
+                    except errors.PhoneCodeInvalidError:
+                        err = "Введен неверный код."
+                        print(f"[Init:Auth] ❌ {err}")
+                        write_auth_status("waiting_code", phone=current_phone, error="invalid_code", message=err)
+                        if server:
+                            server.phone_error = err
+                    except errors.PhoneCodeExpiredError:
+                        err = "Срок действия кода истек."
+                        print(f"[Init:Auth] ❌ {err}")
+                        write_auth_status("error", phone=current_phone, error="code_expired", message=err)
+                        phone_in_progress = False
+                        sent_code_obj = None
+                        if os.path.exists(PHONE_FILE):
+                            try: os.remove(PHONE_FILE)
+                            except Exception: pass
+                        if server:
+                            server.phone_waiting_code = False
+                            server.phone_error = err
+                    except Exception as e:
+                        err = f"Ошибка входа: {e}"
+                        print(f"[Init:Auth] ❌ {err}")
+                        write_auth_status("error", phone=current_phone, error="generic", message=err)
+                        if server:
+                            server.phone_error = err
+
+                await asyncio.sleep(0.5)
+                continue
+
+            # 3. Если телефонная авторизация не идет, проверяем QR
+            if qr_login:
                 try:
-                    with open(PASSWORD_FILE, "w", encoding="utf-8") as f:
-                        f.write("")
-                except Exception:
+                    await qr_login.wait(timeout=2)
+                    print("[Init:Auth] 🎉 Успешный вход по QR-коду!")
+                    write_auth_status("authorized")
+                    await handle_bot_naming(server)
+                    break
+                except asyncio.TimeoutError:
                     pass
-            except Exception as e:
-                error_msg = f"Произошла ошибка при входе: {e}"
-                print(f"\n[Init:Auth] ❌ {error_msg}")
-                try:
-                    with open(PASSWORD_FILE, "w", encoding="utf-8") as f:
-                        f.write("")
-                except Exception:
-                    pass
+                except errors.SessionPasswordNeededError:
+                    print("[Init:Auth] 🔒 Требуется облачный пароль (2FA)!")
+                    write_auth_status("waiting_2fa")
+                    await handle_2fa_flow(client, server)
+                    await handle_bot_naming(server)
+                    break
+                except Exception as e:
+                    if "token expired" in str(e).lower() or "timeout" in str(e).lower():
+                        print("[Init:Auth] Время жизни QR-кода истекло, генерируем новый...")
+                        try:
+                            await qr_login.recreate()
+                            save_qr_image(qr_login.url)
+                            if server:
+                                update_qr_ui(qr_login.url, "Время действия предыдущего QR-кода истекло. Отсканируйте новый.")
+                        except Exception:
+                            pass
+            else:
+                await asyncio.sleep(1)
 
     except Exception as e:
-        update_qr_ui(qr_login.url, f"Ошибка при входе: {e}")
+        if server and qr_login:
+            update_qr_ui(qr_login.url, f"Ошибка при входе: {e}")
         print(f"[Init:Auth] Ошибка при входе: {e}")
         await client.disconnect()
-        close_qr_ui(server, tunnel_process)
+        if server:
+            close_qr_ui(server, tunnel_process)
         sys.exit(1)
-    
-    close_qr_ui(server, tunnel_process)
+
+    if server:
+        close_qr_ui(server, tunnel_process)
 
 
 async def handle_bot_naming(server):

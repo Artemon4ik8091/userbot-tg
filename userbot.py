@@ -58,7 +58,8 @@ from registry import (
     ensure_log_chat,
     get_log_chat_id,
     set_log_chat_id,
-    get_prefix
+    get_prefix,
+    get_cache_dir
 )
 
 core_logger = get_logger("Core")
@@ -298,6 +299,7 @@ async def auto_setup_bot(userbot_client, me):
 def load_modules():
     """Динамически подгружает все .py файлы из папок system_modules и modules"""
     base_dir = os.path.dirname(os.path.abspath(__file__))
+    get_cache_dir()  # Инициализируем общую директорию кэша (cache/)
     folders_to_load = {'system_modules': True, 'modules': False}
 
     importlib.invalidate_caches()

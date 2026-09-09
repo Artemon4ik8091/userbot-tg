@@ -5,6 +5,8 @@ import os
 import sys
 import time
 import asyncio
+import re
+import shutil
 from datetime import datetime, timedelta
 from telethon import errors
 
@@ -342,8 +344,13 @@ async def check_cmd_rate_limit():
         await asyncio.sleep(rate_limiter_state["min_interval"] - elapsed)
     rate_limiter_state["last_cmd_time"] = time.time()
 
-# --- ПРЕФИКС КОМАНД ЮЗЕРБОТА ---
-CORE_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "core_conf.json")
+# --- БАЗОВЫЕ ПУТИ И ПРЕФИКС КОМАНД ЮЗЕРБОТА ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CORE_CONFIG_FILE = os.path.join(BASE_DIR, "core_conf.json")
+CACHE_DIR = os.path.join(BASE_DIR, "cache")
+BACKUPS_DIR = os.path.join(BASE_DIR, "backups")
+MODULES_DIR = os.path.join(BASE_DIR, "modules")
+SYSTEM_MODULES_DIR = os.path.join(BASE_DIR, "system_modules")
 _current_prefix = None
 
 def get_prefix() -> str:
@@ -409,9 +416,8 @@ def reload_prefix() -> str:
     _current_prefix = None
     return get_prefix()
 
-# --- СИСТЕМА КОНФИГУРАЦИЙ ---
 # --- СИСТЕМА КОНФИГУРАЦИЙ И КАНОНИЗАЦИИ МОДУЛЕЙ ---
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Global_config.json")
+CONFIG_FILE = os.path.join(BASE_DIR, "Global_config.json")
 global_config = {}
 
 def normalize_module_name(name: str) -> str:
@@ -451,7 +457,8 @@ def normalize_module_name(name: str) -> str:
         "module_help": "help",
         "module_installer": "installer",
         "module_terminal": "terminal",
-        "module_gh_installer": "gh_installer"
+        "module_gh_installer": "gh_installer",
+        "module_backup": "backup"
     }
     
     clean_lower = clean.lower()
@@ -459,6 +466,69 @@ def normalize_module_name(name: str) -> str:
         return known_aliases[clean_lower]
 
     return clean
+
+# --- СИСТЕМА ОБЩЕГО КЭША И БЭКАПОВ ---
+def get_cache_dir(module_name: str = None) -> str:
+    """
+    Возвращает абсолютный путь к общей директории кэша (cache/)
+    или к персональной подпапке модуля в кэше (cache/<module_name>/).
+    Автоматически создает директорию, если она не существует.
+    """
+    if module_name:
+        canon = normalize_module_name(str(module_name)).lower()
+        clean = re.sub(r'[^a-z0-9_\-]', '_', canon)
+        target = os.path.join(CACHE_DIR, clean)
+    else:
+        target = CACHE_DIR
+    os.makedirs(target, exist_ok=True)
+    return target
+
+def get_backups_dir() -> str:
+    """
+    Возвращает абсолютный путь к директории локальных бэкапов (backups/).
+    Автоматически создает директорию, если она не существует.
+    """
+    os.makedirs(BACKUPS_DIR, exist_ok=True)
+    return BACKUPS_DIR
+
+def get_cache_size(module_name: str = None) -> int:
+    """
+    Возвращает общий размер файлов кэша в байтах для модуля или всей папки кэша.
+    """
+    target = get_cache_dir(module_name) if module_name else CACHE_DIR
+    if not os.path.exists(target):
+        return 0
+    total = 0
+    for root, _, files in os.walk(target):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total
+
+def clear_cache(module_name: str = None) -> int:
+    """
+    Очищает кэш указанного модуля или всю общую директорию кэша.
+    Возвращает количество удаленных файлов.
+    """
+    target = get_cache_dir(module_name) if module_name else CACHE_DIR
+    if not os.path.exists(target):
+        return 0
+    count = 0
+    for root, dirs, files in os.walk(target, topdown=False):
+        for f in files:
+            try:
+                os.remove(os.path.join(root, f))
+                count += 1
+            except OSError:
+                pass
+        if root != CACHE_DIR:
+            try:
+                os.rmdir(root)
+            except OSError:
+                pass
+    return count
 
 def load_config():
     """

@@ -22,6 +22,10 @@ def set_debug_mode(enabled: bool):
     global DEBUG_MODE
     DEBUG_MODE = bool(enabled)
 
+def is_host_mode() -> bool:
+    """Возвращает True, если юзербот запущен в режиме хостинга (--host)."""
+    return "--host" in sys.argv
+
 # --- ХРАНИЛИЩЕ И ОТПРАВКА ЛОГОВ В ЧАТ ubtg-logs ---
 log_chat_state = {
     "chat_id": None
@@ -942,3 +946,485 @@ async def send_inline(client, chat_id, text, buttons=None, reply_to=None):
     except Exception as e:
         print(f"[Registry] Ошибка отправки inline-сообщения: {e}")
         raise e
+
+
+# ==============================================================================
+# СИСТЕМА УПРАВЛЕНИЯ ПРОКСИ ДЛЯ МОДУЛЕЙ И ЯДРА
+# ==============================================================================
+
+def parse_proxy_url(url: str) -> dict | None:
+    """Парсит строку URL прокси в словарь конфигурации."""
+    if not url or not isinstance(url, str):
+        return None
+    clean = url.strip()
+    if not clean:
+        return None
+    if not clean.startswith(('http://', 'https://', 'socks5://', 'socks4://')):
+        clean = 'http://' + clean
+    try:
+        from urllib.parse import urlparse
+        p = urlparse(clean)
+        scheme = p.scheme.lower()
+        port = p.port or (1080 if 'socks' in scheme else 8080)
+        return {
+            "proxy_type": scheme,
+            "addr": p.hostname,
+            "port": port,
+            "username": p.username,
+            "password": p.password
+        }
+    except Exception as e:
+        logger = get_logger("Proxy")
+        logger.error(f"Ошибка парсинга URL прокси '{url}': {e}")
+        return None
+
+
+def format_proxy_url(p: dict) -> str:
+    """Форматирует словарь прокси в строку URL."""
+    if not isinstance(p, dict) or not p.get("addr") or not p.get("port"):
+        return ""
+    ptype = str(p.get("proxy_type", "http")).lower()
+    user = p.get("username")
+    pwd = p.get("password")
+    auth = f"{user}:{pwd}@" if user and pwd else ""
+    return f"{ptype}://{auth}{p['addr']}:{p['port']}"
+
+
+def get_core_proxy_config() -> dict | None:
+    """Возвращает настройки прокси ядра из core_conf.json или Global_config.json."""
+    if os.path.exists(CORE_CONFIG_FILE):
+        try:
+            with open(CORE_CONFIG_FILE, "r", encoding="utf-8") as f:
+                core_data = json.load(f)
+            p = core_data.get("proxy")
+            if isinstance(p, dict) and p.get("addr") and p.get("port"):
+                return {
+                    "proxy_type": str(p.get("proxy_type", "http")).lower(),
+                    "addr": str(p.get("addr")),
+                    "port": int(p.get("port")),
+                    "username": p.get("username"),
+                    "password": p.get("password")
+                }
+        except Exception:
+            pass
+
+    gp = get_config("proxy_manager", "core_proxy", None)
+    if isinstance(gp, dict) and gp.get("addr") and gp.get("port"):
+        return {
+            "proxy_type": str(gp.get("proxy_type", "http")).lower(),
+            "addr": str(gp.get("addr")),
+            "port": int(gp.get("port")),
+            "username": gp.get("username"),
+            "password": gp.get("password")
+        }
+
+    return None
+
+
+def get_core_proxy_url() -> str:
+    """Возвращает URL прокси ядра."""
+    cfg = get_core_proxy_config()
+    if cfg:
+        return format_proxy_url(cfg)
+
+    for ev in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+        val = os.getenv(ev, "").strip()
+        if val:
+            return val
+    return ""
+
+
+def set_core_proxy(proxy_data) -> dict | None:
+    """Устанавливает и сохраняет прокси ядра в core_conf.json и Global_config.json."""
+    if is_host_mode():
+        logger = get_logger("Proxy")
+        logger.warning("Попытка изменения прокси ядра заблокирована: юзербот запущен в режиме хостинга (--host).")
+        return None
+
+    if isinstance(proxy_data, str):
+        proxy_dict = parse_proxy_url(proxy_data)
+    elif isinstance(proxy_data, dict):
+        proxy_dict = proxy_data
+    else:
+        return None
+
+    if not proxy_dict or not proxy_dict.get("addr") or not proxy_dict.get("port"):
+        return None
+
+    # 1. Сохраняем в core_conf.json
+    if os.path.exists(CORE_CONFIG_FILE):
+        try:
+            with open(CORE_CONFIG_FILE, "r", encoding="utf-8") as f:
+                core_data = json.load(f)
+            core_data["proxy"] = proxy_dict
+            with open(CORE_CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(core_data, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            logger = get_logger("Proxy")
+            logger.error(f"Ошибка сохранения proxy в core_conf.json: {e}")
+
+    # 2. Сохраняем в Global_config.json
+    set_config("proxy_manager", "core_proxy", proxy_dict)
+    return proxy_dict
+
+
+def clear_core_proxy() -> bool:
+    """Очищает прокси ядра."""
+    if is_host_mode():
+        logger = get_logger("Proxy")
+        logger.warning("Попытка удаления прокси ядра заблокирована: юзербот запущен в режиме хостинга (--host).")
+        return False
+
+    if os.path.exists(CORE_CONFIG_FILE):
+        try:
+            with open(CORE_CONFIG_FILE, "r", encoding="utf-8") as f:
+                core_data = json.load(f)
+            core_data.pop("proxy", None)
+            with open(CORE_CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(core_data, f, indent=4, ensure_ascii=False)
+        except Exception:
+            pass
+
+    delete_config("proxy_manager", "core_proxy")
+    return True
+
+
+def get_user_proxies() -> dict[str, dict]:
+    """Возвращает словарь пользовательских прокси {alias: {name, url, proxy_type, addr, port, username, password, created_at}}."""
+    return get_config("proxy_manager", "user_proxies", {})
+
+
+def get_user_proxy(alias: str) -> dict | None:
+    """Возвращает данные пользовательского прокси по его алиасу."""
+    if not alias or not isinstance(alias, str):
+        return None
+    proxies = get_user_proxies()
+    return proxies.get(alias.strip())
+
+
+def add_user_proxy(alias: str, url: str, name: str = None) -> tuple[bool, str, dict | None]:
+    """
+    Добавляет или обновляет пользовательский прокси в пуле.
+    Возвращает (успех: bool, сообщение: str, данные_прокси: dict | None).
+    """
+    if not alias or not isinstance(alias, str):
+        return False, "Алиас прокси не может быть пустым", None
+
+    clean_alias = alias.strip()
+    if not re.match(r"^[a-zA-Z0-9_\-]+$", clean_alias):
+        return False, "Алиас может содержать только буквы, цифры, дефис и подчеркивание", None
+
+    if clean_alias.lower() in ("core", "off", "none", "all", "system", "direct"):
+        return False, f"Алиас '{clean_alias}' зарезервирован системой", None
+
+    parsed = parse_proxy_url(url)
+    if not parsed or not parsed.get("addr") or not parsed.get("port"):
+        return False, "Неверный формат URL прокси (пример: socks5://user:pass@1.2.3.4:1080 или http://ip:port)", None
+
+    display_name = name.strip() if name and isinstance(name, str) and name.strip() else f"Прокси {clean_alias}"
+    proxy_entry = {
+        "alias": clean_alias,
+        "name": display_name,
+        "url": format_proxy_url(parsed),
+        "proxy_type": parsed["proxy_type"],
+        "addr": parsed["addr"],
+        "port": parsed["port"],
+        "username": parsed.get("username"),
+        "password": parsed.get("password"),
+        "created_at": int(time.time())
+    }
+
+    proxies = dict(get_user_proxies())
+    proxies[clean_alias] = proxy_entry
+    set_config("proxy_manager", "user_proxies", proxies)
+    return True, f"Прокси '{clean_alias}' успешно сохранен", proxy_entry
+
+
+def remove_user_proxy(alias: str) -> bool:
+    """Удаляет пользовательский прокси и сбрасывает модули, использовавшие его, на прямое подключение."""
+    if not alias or not isinstance(alias, str):
+        return False
+    clean_alias = alias.strip()
+    proxies = dict(get_user_proxies())
+    if clean_alias not in proxies:
+        return False
+
+    del proxies[clean_alias]
+    set_config("proxy_manager", "user_proxies", proxies)
+
+    perms = dict(get_module_proxy_permissions())
+    changed = False
+    for mod, route in list(perms.items()):
+        if route == clean_alias:
+            perms[mod] = "off"
+            changed = True
+    if changed:
+        set_config("proxy_manager", "modules", perms)
+
+    return True
+
+
+def get_module_proxy_permissions() -> dict:
+    """Возвращает словарь назначений прокси для модулей {module_name: route}."""
+    return get_config("proxy_manager", "modules", {})
+
+
+def get_module_proxy_route(module_name: str) -> str:
+    """
+    Возвращает текущий маршрут прокси для модуля:
+    - 'off': прямое подключение без прокси
+    - 'core': системный прокси ядра
+    - '<alias>': алиас пользовательского прокси
+    """
+    if not module_name:
+        return "off"
+    canon = normalize_module_name(module_name)
+    perms = get_module_proxy_permissions()
+    val = perms.get(canon)
+    if val is True or val == "core":
+        return "core"
+    elif val is False or val == "off" or val is None:
+        return "off"
+    elif isinstance(val, str) and val in get_user_proxies():
+        return val
+    return "off"
+
+
+def set_module_proxy_route(module_name: str, route: str):
+    """Устанавливает маршрут прокси для модуля ('off', 'core' или <alias>)."""
+    if not module_name:
+        return
+    canon = normalize_module_name(module_name)
+    clean_route = route.strip() if isinstance(route, str) else ("core" if route else "off")
+    perms = dict(get_module_proxy_permissions())
+    perms[canon] = clean_route
+    set_config("proxy_manager", "modules", perms)
+
+
+def get_module_effective_proxy_url(module_name: str) -> str | None:
+    """
+    Возвращает фактический URL прокси, через который должен идти трафик модуля,
+    либо None, если для модуля выбрано прямое подключение ('off').
+    """
+    route = get_module_proxy_route(module_name)
+    if route == "off":
+        return None
+    elif route == "core":
+        url = get_core_proxy_url()
+        return url if url else None
+    else:
+        uprx = get_user_proxy(route)
+        if uprx and uprx.get("url"):
+            return uprx["url"]
+    return None
+
+
+def get_module_proxy_permission(module_name: str) -> bool | None:
+    """Для обратной совместимости."""
+    if not module_name:
+        return None
+    canon = normalize_module_name(module_name)
+    perms = get_module_proxy_permissions()
+    if canon in perms:
+        val = perms[canon]
+        return val != "off" and bool(val)
+    return None
+
+
+def set_module_proxy_permission(module_name: str, enabled: bool):
+    """Для обратной совместимости: включает 'core' или отключает 'off'."""
+    set_module_proxy_route(module_name, "core" if enabled else "off")
+
+
+def is_module_proxy_enabled(module_name: str) -> bool:
+    """Проверяет, активен ли какой-либо прокси для модуля."""
+    return get_module_proxy_route(module_name) != "off"
+
+
+async def check_proxy_ping(proxy_input, timeout: float = 4.0) -> dict:
+    """
+    Проверяет сетевой пинг (TCP RTT) и выходной IP прокси.
+    proxy_input может быть строкой URL, словарем прокси или алиасом.
+    """
+    cfg = None
+    url = ""
+    if isinstance(proxy_input, str):
+        inp = proxy_input.strip()
+        if inp.lower() == "core":
+            cfg = get_core_proxy_config()
+            url = get_core_proxy_url()
+        elif inp in get_user_proxies():
+            cfg = get_user_proxy(inp)
+            url = cfg.get("url", "") if cfg else ""
+        else:
+            cfg = parse_proxy_url(inp)
+            url = format_proxy_url(cfg) if cfg else inp
+    elif isinstance(proxy_input, dict):
+        cfg = proxy_input
+        url = format_proxy_url(cfg)
+
+    if not cfg or not cfg.get("addr") or not cfg.get("port"):
+        return {"ok": False, "error": "Неверный адрес или порт прокси", "ping_ms": None, "ip": None}
+
+    host = cfg["addr"]
+    port = int(cfg["port"])
+
+    # 1. Измеряем чистый сетевой TCP пинг до сервера прокси
+    try:
+        t0 = time.perf_counter()
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port),
+            timeout=timeout
+        )
+        ping_ms = round((time.perf_counter() - t0) * 1000, 1)
+        writer.close()
+        await writer.wait_closed()
+    except asyncio.TimeoutError:
+        return {"ok": False, "error": f"Таймаут подключения ({timeout}с)", "ping_ms": None, "ip": None}
+    except Exception as e:
+        return {"ok": False, "error": f"Сбой: {e}", "ping_ms": None, "ip": None}
+
+    # 2. Проверяем туннелирование и внешний IP (в отдельном потоке)
+    def _test_exit_ip(target_url):
+        try:
+            import requests
+            resp = requests.get(
+                "http://api.ipify.org?format=json",
+                proxies={"http": target_url, "https": target_url},
+                timeout=timeout
+            )
+            if resp.status_code == 200:
+                return resp.json().get("ip")
+        except Exception:
+            pass
+        return None
+
+    exit_ip = None
+    if url:
+        try:
+            exit_ip = await asyncio.to_thread(_test_exit_ip, url)
+        except Exception:
+            pass
+
+    return {
+        "ok": True,
+        "ping_ms": ping_ms,
+        "ip": exit_ip or host,
+        "tunnel_ok": bool(exit_ip),
+        "error": None
+    }
+
+
+def module_requests_proxy(code: str, mod_meta: dict = None) -> bool:
+    """Проверяет, запрашивает ли модуль доступ к прокси в коде или метаданных."""
+    if mod_meta and isinstance(mod_meta, dict):
+        if mod_meta.get("proxy") or mod_meta.get("requires_proxy"):
+            return True
+    if not code or not isinstance(code, str):
+        return False
+    match = re.search(r"^\s*#\s*(?:requires_)?proxy:\s*(.+)$", code, re.MULTILINE | re.IGNORECASE)
+    if match:
+        val = match.group(1).strip().lower()
+        if val in ("true", "1", "yes", "да", "required", "optional", "proxy", "on"):
+            return True
+    return False
+
+
+def get_originating_module() -> str | None:
+    """
+    Определяет имя пользовательского модуля (из папки modules/),
+    инициировавшего сетевой вызов в текущем потоке/стеке.
+    """
+    try:
+        f = sys._getframe(1)
+    except Exception:
+        return None
+
+    while f:
+        fn = getattr(f.f_code, 'co_filename', '')
+        if fn:
+            norm = fn.replace('\\', '/')
+            if '/modules/' in norm and '/system_modules/' not in norm and '/init_modules/' not in norm:
+                rel = norm.split('/modules/')[-1]
+                base = os.path.basename(rel)
+                if base.endswith('.py') and not base.startswith('__'):
+                    return os.path.splitext(base)[0]
+        f = f.f_back
+    return None
+
+
+_requests_patched = False
+_aiohttp_patched = False
+_urllib_patched = False
+
+def install_proxy_interceptors():
+    """
+    Устанавливает прозрачный перехват сетевых запросов (requests, aiohttp, urllib)
+    для автоматической маршрутизации трафика разрешенных модулей через настроенный прокси.
+    """
+    global _requests_patched, _aiohttp_patched, _urllib_patched
+
+    # 1. requests.Session.send
+    if not _requests_patched:
+        try:
+            import requests
+            _orig_session_send = requests.Session.send
+
+            def _patched_requests_send(self, request, **kwargs):
+                orig_mod = get_originating_module()
+                if orig_mod:
+                    p_url = get_module_effective_proxy_url(orig_mod)
+                    if p_url:
+                        cur_proxies = kwargs.get('proxies') or getattr(self, 'proxies', None)
+                        if not cur_proxies:
+                            kwargs['proxies'] = {'http': p_url, 'https': p_url}
+                return _orig_session_send(self, request, **kwargs)
+
+            requests.Session.send = _patched_requests_send
+            _requests_patched = True
+        except ImportError:
+            pass
+
+    # 2. aiohttp.ClientSession._request
+    if not _aiohttp_patched:
+        try:
+            import aiohttp
+            _orig_client_request = aiohttp.ClientSession._request
+
+            async def _patched_aiohttp_request(self, method, str_or_url, **kwargs):
+                orig_mod = get_originating_module()
+                if orig_mod:
+                    p_url = get_module_effective_proxy_url(orig_mod)
+                    if p_url and not kwargs.get('proxy'):
+                        kwargs['proxy'] = p_url
+                return await _orig_client_request(self, method, str_or_url, **kwargs)
+
+            aiohttp.ClientSession._request = _patched_aiohttp_request
+            _aiohttp_patched = True
+        except ImportError:
+            pass
+
+    # 3. urllib.request.urlopen
+    if not _urllib_patched:
+        try:
+            import urllib.request as ur
+            _orig_urlopen = ur.urlopen
+
+            def _patched_urlopen(url, *args, **kwargs):
+                orig_mod = get_originating_module()
+                if orig_mod:
+                    p_url = get_module_effective_proxy_url(orig_mod)
+                    if p_url:
+                        handler = ur.ProxyHandler({'http': p_url, 'https': p_url})
+                        opener = ur.build_opener(handler)
+                        return opener.open(url, *args, **kwargs)
+                return _orig_urlopen(url, *args, **kwargs)
+
+            ur.urlopen = _patched_urlopen
+            _urllib_patched = True
+        except Exception:
+            pass
+
+
+# Автоматическая активация перехватчиков при загрузке реестра
+install_proxy_interceptors()

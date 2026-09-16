@@ -90,14 +90,32 @@ def get_module_requires(filepath: str) -> list:
 async def pip_install(package_name: str) -> bool:
     """Асинхронная установка пакета через pip."""
     logger.info(f"Установка зависимости {package_name} через pip...")
+    allow_break = bool(get_config("gh_installer", "allow_break_system_packages", False)) or bool(get_config("installer", "allow_break_system_packages", False))
     try:
+        cmd = [sys.executable, "-m", "pip", "install"]
+        if allow_break:
+            cmd.append("--break-system-packages")
+        cmd.append(package_name)
         proc = await asyncio.create_subprocess_exec(
-            sys.executable, "-m", "pip", "install", package_name,
+            *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        await proc.communicate()
-        return proc.returncode == 0
+        _, stderr = await proc.communicate()
+        if proc.returncode == 0:
+            return True
+        err_msg = stderr.decode('utf-8', errors='ignore').strip()
+        if not allow_break and ("--break-system-packages" in err_msg.lower() or "externally-managed-environment" in err_msg.lower()):
+            logger.warning(f"PEP 668 при установке {package_name} в backup.py, пробую с --break-system-packages...")
+            cmd = [sys.executable, "-m", "pip", "install", "--break-system-packages", package_name]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await proc.communicate()
+            return proc.returncode == 0
+        return False
     except Exception as e:
         logger.error(f"Ошибка установки {package_name}: {e}")
         return False

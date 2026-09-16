@@ -20,12 +20,18 @@ from registry import (
     send_inline,
     get_owner_id,
     get_bot,
+    get_bot_username,
     get_main_client,
     get_config,
     set_config,
     init_config,
     send_bot_notification,
-    get_prefix
+    get_prefix,
+    module_requests_proxy,
+    get_module_proxy_permission,
+    set_module_proxy_permission,
+    is_module_proxy_enabled,
+    get_core_proxy_url
 )
 
 logger = get_logger("GHInstaller")
@@ -40,7 +46,8 @@ set_module_meta(
 init_config("gh_installer", {
     "auto_check_modules": True,
     "check_interval": 900,  # 15 минут в секундах
-    "snoozed_hashes": {}
+    "snoozed_hashes": {},
+    "allow_break_system_packages": False
 })
 
 # 🔗 Ссылка на репозиторий (только Gitea)
@@ -138,11 +145,31 @@ def find_installed_module_file(mod):
     return None
 
 
-async def pip_install(package_name):
-    """Асинхронная установка пакетов через pip."""
-    logger.info(f"Запуск установки пакета pip: {package_name}")
+def is_pep668_error(err_msg: str) -> bool:
+    """Проверяет, вызвана ли ошибка pip ограничением PEP 668 (externally-managed-environment)."""
+    if not err_msg:
+        return False
+    msg_lower = err_msg.lower()
+    return (
+        "--break-system-packages" in msg_lower
+        or "externally-managed-environment" in msg_lower
+        or "pep 668" in msg_lower
+    )
+
+
+async def pip_install(package_name, break_system_packages=False):
+    """Асинхронная установка пакетов через pip с поддержкой флага --break-system-packages."""
+    logger.info(f"Запуск установки пакета pip: {package_name} (break_system_packages={break_system_packages})")
+    cmd = [sys.executable, "-m", "pip", "install"]
+    if break_system_packages:
+        cmd.append("--break-system-packages")
+    if isinstance(package_name, (list, tuple)):
+        cmd.extend(package_name)
+    else:
+        cmd.append(str(package_name))
+
     process = await asyncio.create_subprocess_exec(
-        sys.executable, "-m", "pip", "install", package_name,
+        *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE
     )
@@ -532,11 +559,219 @@ def build_list_view(session_id):
     return text, buttons
 
 
-async def perform_module_install(client, chat_id, message_id, package_alias, event=None):
+_pending_bsp_confirmations = {}  # {chat_id: {"alias": alias, "time": timestamp, ...}}
+
+
+async def show_pep668_confirmation(client, chat_id, message_id, package_alias, missing_pkg, event=None):
+    """
+    Предупреждает пользователя об ошибке PEP 668 и флаге --break-system-packages,
+    запрашивая подтверждение на продолжение установки.
+    """
+    prefix = get_prefix() or "."
+    warn_text = (
+        f"⚠️ **Внимание: Защита системного окружения (PEP 668)!**\n\n"
+        f"📦 Модуль `{package_alias}` требует библиотеку `{missing_pkg}`.\n"
+        f"🔒 В вашей операционной системе активен режим `externally-managed-environment`, "
+        f"который блокирует автоматическую установку пакетов в системный Python.\n\n"
+        f"ℹ️ Для установки этой библиотеки в текущую систему требуется флаг:\n"
+        f"`--break-system-packages`\n\n"
+        f"⚠️ **Предупреждение:** Этот флаг принудительно устанавливает пакет в системное окружение ОС. "
+        f"В большинстве случаев это безопасно для модулей юзербота, но может нести "
+        f"потенциальный риск конфликта с системными пакетами дистрибутива Linux.\n\n"
+        f"❓ **Вы точно хотите продолжить установку с этим флагом?**"
+    )
+
+    buttons = [
+        [
+            Button.inline("✅ Да, продолжить (--break-system-packages)", f"gh_bsp:yes:{package_alias}".encode()),
+        ],
+        [
+            Button.inline("🔄 Всегда разрешать (для всех модулей)", f"gh_bsp:always:{package_alias}".encode()),
+        ],
+        [
+            Button.inline("❌ Отменить установку", f"gh_bsp:cancel:{package_alias}".encode())
+        ]
+    ]
+
+    _pending_bsp_confirmations[str(chat_id)] = {
+        "alias": package_alias,
+        "missing_pkg": missing_pkg,
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "time": time.time()
+    }
+
+    # 1. Если event - это inline callback query, редактируем его кнопками
+    if event and hasattr(event, "edit"):
+        try:
+            await event.edit(warn_text, buttons=buttons)
+            return
+        except Exception:
+            pass
+
+    # 2. Пробуем отправить инлайн-сообщение с кнопками через send_inline
+    bot_username = get_bot_username()
+    target_client = client or get_main_client()
+    if target_client and bot_username:
+        try:
+            await send_inline(
+                target_client,
+                chat_id,
+                warn_text,
+                buttons=buttons
+            )
+            if event and hasattr(event, "delete"):
+                try:
+                    await event.delete()
+                except Exception:
+                    pass
+            return
+        except Exception as e:
+            logger.debug(f"send_inline в show_pep668_confirmation не сработал: {e}")
+
+    # 3. Fallback: редактируем исходное сообщение обычным текстом с подсказками
+    fallback_text = (
+        warn_text +
+        f"\n\n💡 **Варианты действий:**\n"
+        f"• Нажмите кнопку выше (если отображаются)\n"
+        f"• Или введите команду: `{prefix}confirm` (или `{prefix}yes`)\n"
+        f"• Или запустите с флагом: `{prefix}ghinstall {package_alias} --break-system-packages`\n"
+        f"• Разрешить навсегда: `{prefix}cfg set gh_installer allow_break_system_packages true`\n"
+        f"• Отмена: `{prefix}cancel`"
+    )
+
+    if event and hasattr(event, "edit"):
+        try:
+            await event.edit(fallback_text, buttons=None)
+            return
+        except Exception:
+            pass
+
+    bot = get_bot()
+    if bot:
+        try:
+            await bot.edit_message(chat_id, message_id, fallback_text, buttons=None)
+            return
+        except Exception:
+            pass
+
+    if target_client:
+        try:
+            await target_client.edit_message(chat_id, message_id, fallback_text, buttons=None)
+            return
+        except Exception:
+            pass
+
+
+_pending_proxy_confirmations = {}  # {chat_id: {"alias": alias, "time": timestamp, ...}}
+
+
+async def show_proxy_confirmation(client, chat_id, message_id, package_alias, module_name, event=None, allow_break_system_packages=False):
+    """
+    Запрашивает у пользователя разрешение на маршрутизацию сетевых запросов модуля через прокси ядра.
+    """
+    prefix = get_prefix() or "."
+    core_proxy_url = get_core_proxy_url()
+    proxy_status_str = f"`{core_proxy_url}`" if core_proxy_url else "*(прокси ядра пока не настроен, можно задать через `.proxy set`)*"
+
+    warn_text = (
+        f"🌐 **Запрос доступа к прокси для модуля `{package_alias}`!**\n\n"
+        f"📦 Модуль `{package_alias}` запрашивает маршрутизацию сетевых запросов через прокси ядра.\n\n"
+        f"🔌 **Текущий прокси ядра:**\n{proxy_status_str}\n\n"
+        f"❓ **Разрешить модулю `{package_alias}` использовать прокси юзербота?**\n\n"
+        f"• **Разрешить:** все HTTP/HTTPS запросы модуля пойдут через сетевой прокси ядра.\n"
+        f"• **Отклонить:** модуль будет подключаться к сети напрямую без использования прокси.\n\n"
+        f"💡 *Вы всегда сможете изменить выбор позже в меню `{prefix}proxy`.*"
+    )
+
+    buttons = [
+        [
+            Button.inline("✅ Разрешить прокси", f"gh_px:allow:{package_alias}".encode()),
+            Button.inline("❌ Без прокси (напрямую)", f"gh_px:deny:{package_alias}".encode()),
+        ],
+        [
+            Button.inline("⏹ Отменить установку", f"gh_px:cancel:{package_alias}".encode())
+        ]
+    ]
+
+    _pending_proxy_confirmations[str(chat_id)] = {
+        "alias": package_alias,
+        "module_name": module_name,
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "allow_break": allow_break_system_packages,
+        "time": time.time()
+    }
+
+    # 1. Если event - это inline callback query, редактируем его кнопками
+    if event and hasattr(event, "edit"):
+        try:
+            await event.edit(warn_text, buttons=buttons)
+            return
+        except Exception:
+            pass
+
+    # 2. Пробуем отправить инлайн-сообщение с кнопками через send_inline
+    bot_username = get_bot_username()
+    target_client = client or get_main_client()
+    if target_client and bot_username:
+        try:
+            await send_inline(
+                target_client,
+                chat_id,
+                warn_text,
+                buttons=buttons
+            )
+            if event and hasattr(event, "delete"):
+                try:
+                    await event.delete()
+                except Exception:
+                    pass
+            return
+        except Exception as e:
+            logger.debug(f"send_inline в show_proxy_confirmation не сработал: {e}")
+
+    # 3. Fallback: редактируем исходное сообщение обычным текстом с подсказками
+    fallback_text = (
+        warn_text +
+        f"\n\n💡 **Варианты ответа:**\n"
+        f"• Введите команду: `{prefix}allowproxy` (или `{prefix}proxyyes`)\n"
+        f"• Или команду: `{prefix}denyproxy` (или `{prefix}proxyno`) для прямого доступа\n"
+        f"• Или запустите с флагом: `{prefix}ghinstall {package_alias} --proxy` (или `--no-proxy`)\n"
+        f"• Отмена: `{prefix}cancel`"
+    )
+
+    if event and hasattr(event, "edit"):
+        try:
+            await event.edit(fallback_text, buttons=None)
+            return
+        except Exception:
+            pass
+
+    bot = get_bot()
+    if bot:
+        try:
+            await bot.edit_message(chat_id, message_id, fallback_text, buttons=None)
+            return
+        except Exception:
+            pass
+
+    if target_client:
+        try:
+            await target_client.edit_message(chat_id, message_id, fallback_text, buttons=None)
+            return
+        except Exception:
+            pass
+
+
+async def perform_module_install(client, chat_id, message_id, package_alias, event=None, allow_break_system_packages=False, proxy_choice=None):
     """
     Единая логика скачивания, установки зависимостей, импорта и перезапуска модуля.
     """
-    logger.info(f"Начало установки модуля: {package_alias}")
+    logger.info(f"Начало установки модуля: {package_alias} (allow_break_system_packages={allow_break_system_packages}, proxy_choice={proxy_choice})")
+
+    cfg_allow = bool(get_config("gh_installer", "allow_break_system_packages", False))
+    allow_break = allow_break_system_packages or cfg_allow
 
     async def update_status(text_msg):
         if event:
@@ -596,6 +831,25 @@ async def perform_module_install(client, chat_id, message_id, package_alias, eve
 
         importlib.invalidate_caches()
 
+        # Анализ запроса на использование прокси ядра
+        if proxy_choice is not None:
+            set_module_proxy_permission(package_alias, proxy_choice)
+        else:
+            existing_perm = get_module_proxy_permission(package_alias)
+            if existing_perm is not None:
+                proxy_choice = existing_perm
+            elif module_requests_proxy(code, mod):
+                logger.info(f"Модуль {package_alias} запрашивает доступ к прокси ядра. Запрос подтверждения у пользователя.")
+                return await show_proxy_confirmation(
+                    client,
+                    chat_id,
+                    message_id,
+                    package_alias,
+                    module_name,
+                    event=event,
+                    allow_break_system_packages=allow_break
+                )
+
         # Анализ явных зависимостей из комментариев # requires: ...
         requires_match = re.search(r"^\s*#\s*requires:\s*(.+)$", code, re.MULTILINE | re.IGNORECASE)
         deps = []
@@ -610,8 +864,11 @@ async def perform_module_install(client, chat_id, message_id, package_alias, eve
         if deps:
             await update_status(f"📦 `Найдено зависимостей: {len(deps)}. Устанавливаю: {', '.join(deps)}...`")
             for dep in deps:
-                success, pip_err = await pip_install(dep)
+                success, pip_err = await pip_install(dep, break_system_packages=allow_break)
                 if not success:
+                    if not allow_break and is_pep668_error(pip_err):
+                        logger.warning(f"PEP 668 при установке '{dep}' для '{package_alias}'. Запрос подтверждения.")
+                        return await show_pep668_confirmation(client, chat_id, message_id, package_alias, dep, event=event)
                     tr_err = pip_err[-200:] if len(pip_err) > 200 else pip_err
                     await update_status(f"⚠️ Предупреждение pip при установке `{dep}`:\n`...{tr_err}`\nПродолжаю...")
                     await asyncio.sleep(2)
@@ -635,8 +892,11 @@ async def perform_module_install(client, chat_id, message_id, package_alias, eve
                     raise err
 
                 await update_status(f"🔍 Модулю требуется библиотека `{missing_pkg}`. Устанавливаю через pip...")
-                success, pip_err = await pip_install(missing_pkg)
+                success, pip_err = await pip_install(missing_pkg, break_system_packages=allow_break)
                 if not success:
+                    if not allow_break and is_pep668_error(pip_err):
+                        logger.warning(f"PEP 668 при установке '{missing_pkg}' для '{package_alias}'. Запрос подтверждения.")
+                        return await show_pep668_confirmation(client, chat_id, message_id, package_alias, missing_pkg, event=event)
                     tr_err = pip_err[-300:] if len(pip_err) > 300 else pip_err
                     raise Exception(f"Не удалось установить `{missing_pkg}`.\nОшибка pip:\n`...{tr_err}`")
 
@@ -650,11 +910,18 @@ async def perform_module_install(client, chat_id, message_id, package_alias, eve
                 set_config("gh_installer", "snoozed_hashes", snoozed)
             _last_notified_module_hashes.pop(package_alias, None)
 
-            success_text = f"✅ **Пакет `{mod['name']}` (`{package_alias}`) успешно установлен!**\n🔄 *Перезапускаю юзербота для применения изменений...*"
+            proxy_note = ""
+            if is_module_proxy_enabled(package_alias):
+                core_p = get_core_proxy_url()
+                proxy_note = f"\n🌐 *Трафик модуля направлен через прокси ядра (`{core_p or 'пока не задан'}`).*"
+            elif get_module_proxy_permission(package_alias) is False:
+                proxy_note = f"\n⚪️ *Модуль выходит в сеть напрямую без прокси.*"
+
+            success_text = f"✅ **Пакет `{mod['name']}` (`{package_alias}`) успешно установлен!**{proxy_note}\n🔄 *Перезапускаю юзербота для применения изменений...*"
             await update_status(success_text)
             await asyncio.sleep(0.3)
             logger.info(f"Пакет {package_alias} ({module_name}) успешно установлен. Перезапуск...")
-            final_text = f"✅ **Пакет `{mod['name']}` (`{package_alias}`) успешно установлен и готов к работе!**"
+            final_text = f"✅ **Пакет `{mod['name']}` (`{package_alias}`) успешно установлен и готов к работе!**{proxy_note}"
             target_client = client or get_main_client()
             await restart_userbot(target_client, chat_id, message_id, custom_text=final_text, event=event)
         else:
@@ -735,6 +1002,127 @@ async def cb_gh_install(event, data):
     await event.answer(f"🚀 Запуск установки '{alias}'...")
     msg_id = getattr(event, "message_id", None) or getattr(event, "id", 0)
     await perform_module_install(get_main_client(), event.chat_id, msg_id, alias, event=event)
+
+
+@register_callback("gh_bsp:")
+async def cb_gh_break_system_packages(event, data):
+    """Обработчик подтверждения флага --break-system-packages (PEP 668)."""
+    sender = await event.get_sender()
+    if not is_authorized_user(sender.id):
+        return await event.answer("⚠️ Действие доступно только владельцу!", alert=True)
+
+    payload = data[len("gh_bsp:"):].decode("utf-8") if isinstance(data, bytes) else data[len("gh_bsp:"):]
+    parts = payload.split(":", 1)
+    if len(parts) < 2:
+        return await event.answer("⚠️ Неверный формат данных.", alert=True)
+
+    action, alias = parts[0], parts[1]
+    _pending_bsp_confirmations.pop(str(event.chat_id), None)
+
+    if action == "cancel":
+        await event.answer("❌ Установка отменена.")
+        try:
+            modules_dir = get_modules_dir()
+            for ext in [".py"]:
+                fpath = os.path.join(modules_dir, f"{alias}{ext}")
+                if os.path.exists(fpath) and alias not in sys.modules:
+                    os.remove(fpath)
+        except Exception:
+            pass
+        try:
+            await event.edit(
+                f"❌ **Установка модуля `{alias}` отменена пользователем.**\n\n"
+                f"ℹ️ Для установки зависимостей требовался флаг `--break-system-packages`.",
+                buttons=None
+            )
+        except Exception:
+            pass
+        return
+
+    allow_always = (action == "always")
+    if allow_always:
+        set_config("gh_installer", "allow_break_system_packages", True)
+        set_config("installer", "allow_break_system_packages", True)
+        await event.answer("⚙️ Опция сохранена! Устанавливаю...", alert=False)
+    else:
+        await event.answer("🚀 Продолжаю установку с --break-system-packages...", alert=False)
+
+    msg_id = getattr(event, "message_id", None) or getattr(event, "id", 0)
+    try:
+        await event.edit(
+            f"⏳ `Продолжаю установку '{alias}' с флагом --break-system-packages...`",
+            buttons=None
+        )
+    except Exception:
+        pass
+
+    target_client = get_main_client()
+    await perform_module_install(
+        target_client,
+        event.chat_id,
+        msg_id,
+        alias,
+        event=event,
+        allow_break_system_packages=True
+    )
+
+
+@register_callback("gh_px:")
+async def cb_gh_proxy(event, data):
+    """Обработчик подтверждения использования прокси для модуля."""
+    sender = await event.get_sender()
+    if not is_authorized_user(sender.id):
+        return await event.answer("⚠️ Действие доступно только владельцу!", alert=True)
+
+    payload = data[len("gh_px:"):].decode("utf-8") if isinstance(data, bytes) else data[len("gh_px:"):]
+    parts = payload.split(":", 1)
+    if len(parts) < 2:
+        return await event.answer("⚠️ Неверный формат данных.", alert=True)
+
+    action, alias = parts[0], parts[1]
+    pending = _pending_proxy_confirmations.pop(str(event.chat_id), None)
+    allow_break = pending.get("allow_break", False) if pending else False
+
+    if action == "cancel":
+        await event.answer("❌ Установка отменена.")
+        try:
+            modules_dir = get_modules_dir()
+            for ext in [".py"]:
+                fpath = os.path.join(modules_dir, f"{alias}{ext}")
+                if os.path.exists(fpath) and alias not in sys.modules:
+                    os.remove(fpath)
+        except Exception:
+            pass
+        try:
+            await event.edit(f"❌ **Установка модуля `{alias}` отменена пользователем.**", buttons=None)
+        except Exception:
+            pass
+        return
+
+    choice = (action == "allow")
+    set_module_proxy_permission(alias, choice)
+    status_msg = "Прокси разрешен 🟢" if choice else "Прямое подключение ⚪️"
+    await event.answer(f"{status_msg}!")
+
+    msg_id = getattr(event, "message_id", None) or getattr(event, "id", 0)
+    try:
+        await event.edit(
+            f"⏳ `{status_msg}. Продолжаю установку модуля '{alias}'...`",
+            buttons=None
+        )
+    except Exception:
+        pass
+
+    target_client = get_main_client()
+    await perform_module_install(
+        target_client,
+        event.chat_id,
+        msg_id,
+        alias,
+        event=event,
+        allow_break_system_packages=allow_break,
+        proxy_choice=choice
+    )
 
 
 @register_callback("gh_upd:")
@@ -1100,6 +1488,7 @@ async def perform_bulk_upgrade(client, chat_id, message_id, force_all=False, tar
                     deps = mod["requires"]
                 deps = [d for d in deps if d and d != mod["module_name"] and d != alias]
 
+                allow_break = bool(get_config("gh_installer", "allow_break_system_packages", False))
                 if deps:
                     await update_status(
                         f"⏳ **Обновление модулей** {progress_bar}\n\n"
@@ -1108,7 +1497,7 @@ async def perform_bulk_upgrade(client, chat_id, message_id, force_all=False, tar
                         f"📦 `Установка зависимостей: {', '.join(deps)}...`"
                     )
                     for dep in deps:
-                        await pip_install(dep)
+                        await pip_install(dep, break_system_packages=allow_break)
 
                 # Перезагрузка модуля
                 module_name = mod["module_name"]
@@ -1121,7 +1510,7 @@ async def perform_bulk_upgrade(client, chat_id, message_id, force_all=False, tar
                     upgraded.append(f"{mod_name} (`{alias}`) *({source_used})*")
                 except ModuleNotFoundError as err_mod:
                     if err_mod.name and err_mod.name != module_name and err_mod.name != alias:
-                        await pip_install(err_mod.name)
+                        await pip_install(err_mod.name, break_system_packages=allow_break)
                         importlib.invalidate_caches()
                         if module_name in sys.modules:
                             importlib.reload(sys.modules[module_name])
@@ -1246,15 +1635,101 @@ async def search_module_cmd(client, event, args):
         await event.edit(text, link_preview=True)
 
 
-@register_cmd("ghinstall", desc="Установить модуль из репозитория. Юзай: .ghinstall <имя>")
+@register_cmd("ghinstall", desc="Установить модуль из репозитория. Флаги: [-b] [--proxy / --no-proxy]")
 @register_cmd("ghi", desc="Алиас для .ghinstall")
 async def install_module_cmd(client, event, args):
     """Прямая установка модуля по алиасу."""
     if not args:
         return await event.edit("❌ Укажи имя пакета из репозитория: `.ghinstall spam`\n💡 Список пакетов: `.ghsearch all`")
 
-    package_alias = args.strip().lower()
-    await perform_module_install(client, event.chat_id, event.id, package_alias, event=event)
+    parts = args.split()
+    allow_break = False
+    proxy_choice = None
+    clean_parts = []
+    for p in parts:
+        pl = p.lower()
+        if pl in ("--break-system-packages", "--break", "-b"):
+            allow_break = True
+        elif pl in ("--proxy", "-p"):
+            proxy_choice = True
+        elif pl in ("--no-proxy", "--noproxy", "-np"):
+            proxy_choice = False
+        else:
+            clean_parts.append(p)
+
+    if not clean_parts:
+        return await event.edit("❌ Укажи имя пакета из репозитория: `.ghinstall spam`")
+
+    package_alias = clean_parts[0].strip().lower()
+    await perform_module_install(
+        client,
+        event.chat_id,
+        event.id,
+        package_alias,
+        event=event,
+        allow_break_system_packages=allow_break,
+        proxy_choice=proxy_choice
+    )
+
+
+@register_cmd("confirm", desc="Подтвердить установку модуля с флагом --break-system-packages")
+@register_cmd("yes", desc="Алиас для .confirm")
+async def confirm_install_cmd(client, event, args):
+    """Подтверждение установки модуля при ошибке PEP 668."""
+    chat_key = str(event.chat_id)
+    item = _pending_bsp_confirmations.pop(chat_key, None)
+    if not item:
+        now = time.time()
+        for ck, val in list(_pending_bsp_confirmations.items()):
+            if now - val["time"] < 300:
+                item = val
+                _pending_bsp_confirmations.pop(ck, None)
+                break
+
+    if not item or (time.time() - item["time"] > 300):
+        return await event.edit("⚠️ Нет ожидающих подтверждения запросов на установку.")
+
+    alias = item["alias"]
+    await event.edit(f"🚀 `Подтверждено! Устанавливаю '{alias}' с --break-system-packages...`")
+    await perform_module_install(
+        client,
+        event.chat_id,
+        event.id,
+        alias,
+        event=event,
+        allow_break_system_packages=True
+    )
+
+
+@register_cmd("cancel", desc="Отменить ожидающую установку модуля")
+async def cancel_install_cmd(client, event, args):
+    """Отмена ожидающей установки модуля."""
+    chat_key = str(event.chat_id)
+    item = _pending_bsp_confirmations.pop(chat_key, None) or _pending_proxy_confirmations.pop(chat_key, None)
+    if not item:
+        now = time.time()
+        for pending_dict in (_pending_bsp_confirmations, _pending_proxy_confirmations):
+            for ck, val in list(pending_dict.items()):
+                if now - val["time"] < 300:
+                    item = val
+                    pending_dict.pop(ck, None)
+                    break
+            if item:
+                break
+
+    if item:
+        alias = item["alias"]
+        try:
+            modules_dir = get_modules_dir()
+            for ext in [".py"]:
+                fpath = os.path.join(modules_dir, f"{alias}{ext}")
+                if os.path.exists(fpath) and alias not in sys.modules:
+                    os.remove(fpath)
+        except Exception:
+            pass
+        return await event.edit(f"❌ **Установка модуля `{alias}` отменена.**")
+
+    await event.edit("⚠️ Нет ожидающих действий для отмены.")
 
 
 @register_cmd("ghcheck", desc="Проверить наличие обновлений для установленных модулей")

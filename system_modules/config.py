@@ -21,7 +21,8 @@ from registry import (
     get_bot,
     get_main_client,
     modules_repo,
-    get_logger
+    get_logger,
+    is_host_mode
 )
 
 logger = get_logger("Config")
@@ -1472,6 +1473,9 @@ async def config_manager(client, event, args):
         key = parts[2]
         raw_value = " ".join(parts[3:])
 
+        if is_host_mode() and normalize_module_name(mod_name) in ("proxy_manager", "proxy") and key.lower() == "core_proxy":
+            return await event.edit("🔒 **Действие заблокировано!**\nВ режиме хостинга (`--host`) изменение прокси ядра запрещено хостом.")
+
         # Автоматическое определение типов
         parsed_value = parse_value(raw_value)
 
@@ -1519,6 +1523,9 @@ async def config_manager(client, event, args):
         mod_name = parts[1]
         key = parts[2]
 
+        if is_host_mode() and normalize_module_name(mod_name) in ("proxy_manager", "proxy") and key.lower() == "core_proxy":
+            return await event.edit("🔒 **Действие заблокировано!**\nВ режиме хостинга (`--host`) удаление прокси ядра запрещено хостом.")
+
         if delete_config(mod_name, key):
             await event.edit(f"🗑 **Параметр `{key}` успешно удален из модуля `{mod_name}`!**")
         else:
@@ -1531,6 +1538,9 @@ async def config_manager(client, event, args):
             return await event.edit("❌ Укажите имя модуля: `.cfg delmod <модуль>`")
 
         mod_name = parts[1]
+        if is_host_mode() and normalize_module_name(mod_name) in ("proxy_manager", "proxy"):
+            return await event.edit("🔒 **Действие заблокировано!**\nВ режиме хостинга (`--host`) удаление конфигурации прокси-менеджера запрещено хостом.")
+
         if delete_config(mod_name):
             await event.edit(f"🗑 **Все параметры модуля `{mod_name}` успешно удалены из конфигурации!**")
         else:

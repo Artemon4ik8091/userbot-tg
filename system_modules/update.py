@@ -89,14 +89,14 @@ async def run_pip_requirements(timeout=120):
         return True, "requirements.txt не найден"
 
     logger.debug("Запуск установки / обновления зависимостей из requirements.txt...")
+    allow_break = bool(get_config("gh_installer", "allow_break_system_packages", False)) or bool(get_config("installer", "allow_break_system_packages", False))
     try:
+        cmd = [sys.executable, "-m", "pip", "install"]
+        if allow_break:
+            cmd.append("--break-system-packages")
+        cmd.extend(["-r", req_file])
         process = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "-r",
-            req_file,
+            *cmd,
             cwd=BASE_DIR,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
@@ -106,6 +106,19 @@ async def run_pip_requirements(timeout=120):
             logger.debug("Зависимости pip успешно обновлены")
             return True, stdout.decode("utf-8", errors="replace").strip()
         err = stderr.decode("utf-8", errors="replace").strip() or stdout.decode("utf-8", errors="replace").strip()
+        if not allow_break and ("--break-system-packages" in err.lower() or "externally-managed-environment" in err.lower()):
+            logger.warning(f"PEP 668 в update.py, пробую с --break-system-packages...")
+            cmd = [sys.executable, "-m", "pip", "install", "--break-system-packages", "-r", req_file]
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=BASE_DIR,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+            if process.returncode == 0:
+                return True, stdout.decode("utf-8", errors="replace").strip()
+            err = stderr.decode("utf-8", errors="replace").strip() or stdout.decode("utf-8", errors="replace").strip()
         logger.warning(f"Предупреждение/ошибка pip: {err[:200]}")
         return False, err
     except asyncio.TimeoutError:

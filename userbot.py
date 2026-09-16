@@ -59,7 +59,8 @@ from registry import (
     get_log_chat_id,
     set_log_chat_id,
     get_prefix,
-    get_cache_dir
+    get_cache_dir,
+    install_proxy_interceptors
 )
 
 core_logger = get_logger("Core")
@@ -300,6 +301,10 @@ def load_modules():
     """Динамически подгружает все .py файлы из папок system_modules и modules"""
     base_dir = os.path.dirname(os.path.abspath(__file__))
     get_cache_dir()  # Инициализируем общую директорию кэша (cache/)
+    try:
+        install_proxy_interceptors()
+    except Exception as ex_pi:
+        core_logger.error(f"Ошибка активации перехватчиков прокси: {ex_pi}")
     folders_to_load = {'system_modules': True, 'modules': False}
 
     importlib.invalidate_caches()
